@@ -6,7 +6,7 @@ A reference guide for developers and AI agents on using the netprobe specificati
 
 ## 1. General Philosophy
 
-These specs document netprobe **as implemented**. `src/` is the source of truth: when a spec and the code disagree, fix the spec. (`.qoder/specs/netprobe-spec.md` is the historical design document in Russian — useful for intent, not authoritative for behavior.)
+These specs document netprobe **as implemented**. `src/` is the source of truth: when a spec and the code disagree, fix the spec.
 
 - Specs are optimized for AI agents: predictable structure, explicit cross-references, no filler.
 - Organized by **domains** (probing, metrics store, anomaly detection, logging, TUI), not by directory layout.
@@ -118,7 +118,6 @@ Windows: traceroute works without elevation (`tracert.exe`); ICMP uses the subpr
 - Code paths in Key Files are repo-root-relative backtick paths.
 - Reference tables (interfaces, defaults, detectors) use markdown tables.
 - Flows/architecture use ASCII diagrams that render in monospace.
-- Divergences from `.qoder/specs/netprobe-spec.md` are called out explicitly in a blockquote `> Note:` (see [domains/probing/traceroute.md](domains/probing/traceroute.md) for the pattern).
 
 ---
 

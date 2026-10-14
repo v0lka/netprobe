@@ -29,9 +29,9 @@ Negative:
 
 ## Alternatives Considered
 
-- **SQLite** — rejected: heavier dependency, kills `tail`/`jq` ergonomics; aggregation is out of scope for v1 (see the design doc's future-work list).
+- **SQLite** — rejected: heavier dependency, kills `tail`/`jq` ergonomics; aggregation is out of scope for v1.
 - **Per-layer files** (`icmp.jsonl`, `events.jsonl`, …) — rejected: cross-layer correlation (e.g. did `http_error` follow a `route_change`?) requires timestamp alignment anyway; one timeline is simpler and loss-burst analysis depends on interleaving.
-- **Prometheus endpoint first** — rejected as the persistence layer (pull model loses history across restarts); listed in the design doc as a future exporter, not a replacement.
+- **Prometheus endpoint first** — rejected as the persistence layer (pull model loses history across restarts); plausible as a future exporter, not a replacement.
 
 ## Related Specs
 

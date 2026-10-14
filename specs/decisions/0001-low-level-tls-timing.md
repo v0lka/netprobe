@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-The L7 layer must report four independent timings per tick: TCP connect, TLS handshake, HTTP TTFB, and total HTTP time, plus certificate details (subject, issuer, SAN, expiry). Off-the-shelf HTTP clients (e.g. `reqwest`) perform TCP+TLS+request as one opaque step: they expose total time and (with `tls_info`) the certificate, but not the split between connect and handshake, and not TTFB. The original design doc (`.qoder/specs/netprobe-spec.md`) explicitly evaluated this trade-off.
+The L7 layer must report four independent timings per tick: TCP connect, TLS handshake, HTTP TTFB, and total HTTP time, plus certificate details (subject, issuer, SAN, expiry). Off-the-shelf HTTP clients (e.g. `reqwest`) perform TCP+TLS+request as one opaque step: they expose total time and (with `tls_info`) the certificate, but not the split between connect and handshake, and not TTFB.
 
 ## Decision
 

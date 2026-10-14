@@ -8,8 +8,8 @@ Specifications provide AI coding agents with deterministic context about system 
 
 ## Principles
 
-1. **Code is the source of truth.** These specs document the system as implemented. A discrepancy between spec and code is resolved in favor of the code — fix the spec. (Historical note: `.qoder/specs/netprobe-spec.md` is the original design document, in Russian; where it diverges from the implementation, these specs follow the implementation and may note the divergence.)
-2. **Self-standing documents** — every spec can be read without this conversation or the design doc. No "see chat" references.
+1. **Code is the source of truth.** These specs document the system as implemented. A discrepancy between spec and code is resolved in favor of the code — fix the spec.
+2. **Self-standing documents** — every spec can be read without this conversation. No "see chat" references.
 3. **Agent-optimized** — predictable structure, explicit cross-references, no filler prose. Every section has a purpose.
 4. **Living documents** — updated after code changes that alter documented behavior. Never silently drifting.
 5. **Domain-based** — organized by conceptual domains (probing, metrics store, anomaly detection, logging, TUI), NOT by directory structure alone.
