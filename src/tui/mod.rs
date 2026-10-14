@@ -363,10 +363,8 @@ impl TuiApp {
             }
 
             // Escape to close help
-            KeyCode::Esc => {
-                if self.show_help {
-                    self.show_help = false;
-                }
+            KeyCode::Esc if self.show_help => {
+                self.show_help = false;
             }
 
             _ => {}
