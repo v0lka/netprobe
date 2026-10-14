@@ -12,9 +12,9 @@ Five concurrent producers (four probe cadences + tracing consumer) feed two cons
 
 Hybrid model, implemented in `src/store.rs`, `src/logger.rs`, `src/app.rs`:
 
-- **Dashboard state**: one `MetricsStore` behind `Arc<tokio::sync::RwLock>` (`SharedStore`). Probes take short write-lock sections to push samples/events; the TUI takes one read lock per 250 ms frame; `session_end` takes one read lock for the summary.
+- **Dashboard state**: one `MetricsStore` behind `Arc<tokio::sync::RwLock>` (`SharedStore`). Probes take short write-lock sections to push samples/events; the TUI takes one read lock per 250 ms frame and writes only through the `r` reset and the n/p IP-cycle accessors (each under a write lock); `session_end` takes one read lock for the summary.
 - **Persistence**: an `mpsc` channel (buffer 1024) carries `LogRecord`s to the single logger task that owns the file writer.
-- **Control**: `CancellationToken` (shutdown), `watch<IpAddr>` (target switching), `Notify` (forced traceroute).
+- **Control**: `CancellationToken` (shutdown), `watch<IpAddr>` (target switching), `Notify` (forced traceroute, statistics reset).
 
 ## Consequences
 

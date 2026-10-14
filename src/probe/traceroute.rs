@@ -1,24 +1,21 @@
 //! Traceroute prober
 
-use crate::anomaly::{AnomalyDetector, WindowedWelford};
+use crate::anomaly::{AnomalyDetector, AnomalyEvent, WindowedWelford};
 use crate::models::{LogRecord, TracerouteRecord, TracerouteStatus};
 use crate::probe::ProbeError;
 use crate::store::HopData;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+#[cfg(windows)]
+use tracing::error;
+use tracing::{debug, info, warn};
 
 /// Information about a route change
 #[derive(Debug, Clone)]
 pub struct RouteChangeInfo {
     pub description: String,
-    #[allow(dead_code)]
-    pub old_hops: Vec<Option<IpAddr>>,
-    #[allow(dead_code)]
-    pub new_hops: Vec<Option<IpAddr>>,
 }
 
 /// Information about a per-hop RTT anomaly
@@ -28,6 +25,7 @@ pub struct HopRttAnomalyInfo {
     pub ip: Option<IpAddr>,
     pub rtt_ms: f64,
     pub mean: f64,
+    pub stddev: f64,
     pub sigma: f64,
 }
 
@@ -45,10 +43,16 @@ pub struct TracerouteResult {
 /// Traceroute prober
 pub struct TracerouteProber {
     target: IpAddr,
-    #[allow(dead_code)]
     timeout: Duration,
     previous_hops: Vec<Option<IpAddr>>,
-    hop_rtt_stats: HashMap<usize, WindowedWelford>,
+    /// Per-hop RTT baselines keyed by hop *IP* (not TTL): when the path
+    /// changes and a TTL now resolves to a different router, the new router
+    /// starts a fresh window instead of blending into the old baseline.
+    hop_rtt_stats: HashMap<Option<IpAddr>, WindowedWelford>,
+    /// Worker thread of the most recent timed-out trace (Unix). Kept so at
+    /// most one timed-out trace can be alive at a time.
+    #[cfg(not(windows))]
+    trace_worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TracerouteProber {
@@ -77,6 +81,8 @@ impl TracerouteProber {
             timeout: Duration::from_millis(timeout_ms),
             previous_hops: Vec::new(),
             hop_rtt_stats: HashMap::new(),
+            #[cfg(not(windows))]
+            trace_worker: None,
         })
     }
 
@@ -112,12 +118,25 @@ impl TracerouteProber {
         use std::process::Command;
 
         let target_str = self.target.to_string();
-        debug!("Running tracert -h 30 -w 1000 {}", target_str);
+
+        // tracert has no overall timeout flag; bound the trace by deriving the
+        // per-hop wait (`-w`) from --timeout-trace across the 30-hop maximum
+        // (previously a hardcoded 1000 ms left the flag as a no-op here).
+        let max_hops: u32 = 30;
+        let total_ms = u32::try_from(self.timeout.as_millis()).unwrap_or(u32::MAX);
+        let per_hop_wait_ms = (total_ms / max_hops).max(100);
+        debug!("Running tracert -h 30 -w {per_hop_wait_ms} {}", target_str);
 
         // Run tracert in a blocking task to avoid blocking the async runtime
         let output = tokio::task::block_in_place(|| {
             Command::new("tracert")
-                .args(["-h", "30", "-w", "1000", &target_str])
+                .args([
+                    "-h",
+                    &max_hops.to_string(),
+                    "-w",
+                    &per_hop_wait_ms.to_string(),
+                    &target_str,
+                ])
                 .output()
         });
 
@@ -136,7 +155,9 @@ impl TracerouteProber {
 
                 // Parse tracert output
                 let ip_regex = Regex::new(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b").unwrap();
-                let rtt_regex = Regex::new(r"(\d+)\s*ms").unwrap();
+                // Capture an optional `<`/`>` prefix so "<1 ms" is honored as
+                // a sub-millisecond hop instead of being read as 1 ms
+                let rtt_regex = Regex::new(r"([<>])?\s*(\d+)\s*ms").unwrap();
 
                 for line in stdout.lines() {
                     // Parse lines like:
@@ -152,25 +173,29 @@ impl TracerouteProber {
                             // Find IP address
                             let ip = ip_regex.find(line).and_then(|m| m.as_str().parse().ok());
 
-                            // Find RTT values
-                            let rtt_values: Vec<u32> = rtt_regex
-                                .find_iter(line)
-                                .filter_map(|m| m.as_str().replace("ms", "").trim().parse().ok())
+                            // Find RTT values; a `<` prefix reports a
+                            // sub-millisecond reply, so record it below the
+                            // 1 ms boundary (midpoint) rather than at it
+                            let rtt_values: Vec<f64> = rtt_regex
+                                .captures_iter(line)
+                                .filter_map(|caps| {
+                                    let n: f64 = caps.get(2)?.as_str().parse().ok()?;
+                                    Some(if caps.get(1).is_some() { n / 2.0 } else { n })
+                                })
                                 .collect();
 
                             let avg_rtt = if !rtt_values.is_empty() {
-                                Some(
-                                    rtt_values.iter().sum::<u32>() as f64 / rtt_values.len() as f64,
-                                )
+                                Some(rtt_values.iter().sum::<f64>() / rtt_values.len() as f64)
                             } else {
                                 None
                             };
 
-                            // Update stats for anomaly detection
+                            // Update stats for anomaly detection (keyed by hop
+                            // IP so a route change starts a fresh baseline)
                             if let Some(rtt) = avg_rtt {
                                 let hop_stats = self
                                     .hop_rtt_stats
-                                    .entry(hop_num as usize)
+                                    .entry(ip)
                                     .or_insert_with(WindowedWelford::hop);
 
                                 if hop_stats.is_warm() {
@@ -184,6 +209,7 @@ impl TracerouteProber {
                                                 ip,
                                                 rtt_ms: rtt,
                                                 mean,
+                                                stddev,
                                                 sigma,
                                             });
                                         }
@@ -301,11 +327,27 @@ impl TracerouteProber {
 
     /// Run tracer with a timeout (Unix only)
     #[cfg(not(windows))]
-    fn run_with_timeout(&self, tracer: trippy_core::Tracer) -> Result<trippy_core::State, String> {
+    fn run_with_timeout(
+        &mut self,
+        tracer: trippy_core::Tracer,
+    ) -> Result<trippy_core::State, String> {
         let (tx, rx) = std::sync::mpsc::channel();
         let timeout = self.timeout;
 
-        std::thread::spawn(move || {
+        // Bound leaked workers: trippy's blocking `run()` cannot be cancelled,
+        // so a trace that exceeds the timeout keeps its OS thread alive until
+        // it finishes. Refuse to start a new trace while a previous timed-out
+        // one is still running instead of leaking one thread per tick.
+        if let Some(handle) = self.trace_worker.as_ref()
+            && !handle.is_finished()
+        {
+            return Err(
+                "Previous traceroute still running (previous round timed out); skipping this round"
+                    .to_string(),
+            );
+        }
+
+        let handle = std::thread::spawn(move || {
             let result = tracer.run();
             let state = match result {
                 Ok(_) => {
@@ -316,6 +358,7 @@ impl TracerouteProber {
             };
             let _ = tx.send(state);
         });
+        self.trace_worker = Some(handle);
 
         match rx.recv_timeout(timeout) {
             Ok(result) => result,
@@ -343,9 +386,12 @@ impl TracerouteProber {
             let host: Option<String> = None;
 
             if let Some(rtt) = rtt_ms {
+                // Key the baseline by hop IP: if the path changes and this TTL
+                // now resolves to a different router, the new router gets a
+                // fresh window instead of inheriting the old router's samples
                 let hop_stats = self
                     .hop_rtt_stats
-                    .entry(ttl as usize)
+                    .entry(ip)
                     .or_insert_with(WindowedWelford::hop);
 
                 if hop_stats.is_warm() {
@@ -359,6 +405,7 @@ impl TracerouteProber {
                                 ip,
                                 rtt_ms: rtt,
                                 mean,
+                                stddev,
                                 sigma,
                             });
                         }
@@ -381,9 +428,11 @@ impl TracerouteProber {
         let route_change = self.detect_route_change(&current_hops);
         self.previous_hops = current_hops;
 
+        // Capture the count first, then move the vector (it is not used again)
+        let hop_count = hop_data_vec.len() as u8;
         TracerouteResult {
-            hops: hop_data_vec.clone(),
-            hop_count: hop_data_vec.len() as u8,
+            hops: hop_data_vec,
+            hop_count,
             status: TracerouteStatus::Ok,
             error: None,
             route_change,
@@ -392,40 +441,38 @@ impl TracerouteProber {
     }
 
     /// Detect if the route has changed
+    ///
+    /// A hop that did not answer a trace (`None`) is "unknown", not a changed
+    /// address: routers routinely rate-limit or filter Time-Exceeded, so
+    /// non-answers must never be reported as topology changes. The comparison
+    /// is therefore position-wise and considers only hops where *both* the
+    /// previous and the current trace have an answered IP; a pure hop-count
+    /// difference (hops appearing or going silent) is not a change either.
+    /// The event fires only when an answered hop's IP differs from the
+    /// previous run's IP at the same position.
     fn detect_route_change(&self, current_hops: &[Option<IpAddr>]) -> Option<RouteChangeInfo> {
         if self.previous_hops.is_empty() {
             return None;
         }
 
-        if self.previous_hops == current_hops {
+        let changed_hops: Vec<String> = current_hops
+            .iter()
+            .zip(self.previous_hops.iter())
+            .enumerate()
+            .filter_map(|(i, (current, previous))| match (current, previous) {
+                (Some(current_ip), Some(previous_ip)) if current_ip != previous_ip => {
+                    Some(format!("hop {}: {}", i + 1, current_ip))
+                }
+                _ => None,
+            })
+            .collect();
+
+        if changed_hops.is_empty() {
             return None;
         }
 
-        let old_len = self.previous_hops.len();
-        let new_len = current_hops.len();
-
-        let description = if old_len != new_len {
-            format!("Route hop count changed from {} to {}", old_len, new_len)
-        } else {
-            let changed_hops: Vec<String> = current_hops
-                .iter()
-                .zip(self.previous_hops.iter())
-                .enumerate()
-                .filter(|(_, (new, old))| new != old)
-                .map(|(i, (new, _))| format!("hop {}: {:?}", i + 1, new))
-                .collect();
-
-            if changed_hops.is_empty() {
-                "Route changed (unknown difference)".to_string()
-            } else {
-                format!("Route changed at {}", changed_hops.join(", "))
-            }
-        };
-
         Some(RouteChangeInfo {
-            description,
-            old_hops: self.previous_hops.clone(),
-            new_hops: current_hops.to_vec(),
+            description: format!("Route changed at {}", changed_hops.join(", ")),
         })
     }
 }
@@ -460,7 +507,13 @@ pub async fn traceroute_probe_loop(
                 debug!("Traceroute probe loop cancelled");
                 break;
             }
-            _ = ip_rx.changed() => {
+            res = ip_rx.changed() => {
+                // Closed channel: run_tui (the only sender) is gone — treat
+                // it as shutdown rather than an IP change, so the loop does
+                // not run one more blocking trace on the TUI error-exit path
+                if res.is_err() {
+                    break;
+                }
                 let new_ip = *ip_rx.borrow();
                 info!("Traceroute probe updating target to: {}", new_ip);
                 prober.update_target(new_ip);
@@ -477,152 +530,124 @@ pub async fn traceroute_probe_loop(
             break;
         }
 
-        let result = prober.trace();
+        // trace() blocks the calling thread for up to --timeout-trace (Unix:
+        // waiting on the trace thread; Windows: the tracert process), so run
+        // it off the async worker like the Windows path's internal
+        // block_in_place.
+        let result = tokio::task::block_in_place(|| prober.trace());
 
         // Update store with traceroute results
+        //
+        // The store slot keeps the data-XOR-error invariant like every other
+        // layer: a failed trace stores only the error, so `data.is_some()`
+        // reliably means "the last trace succeeded".
         {
             let mut store_guard = store.write().await;
-            let trace_data = crate::store::TracerouteData {
-                hops: result.hops.clone(),
-                hop_count: result.hop_count,
+            let trace_data = if result.error.is_some() {
+                None
+            } else {
+                Some(crate::store::TracerouteData {
+                    hops: result.hops.clone(),
+                })
             };
-            store_guard.set_latest_traceroute(Some(trace_data), result.error.clone());
+            store_guard.set_latest_traceroute(trace_data, result.error.clone());
         }
 
-        // Publish route change as an anomaly event (store + JSONL)
-        if let Some(ref route_change) = result.route_change {
-            warn!("Route change detected: {}", route_change.description);
-            let anomaly = detector.on_route_change(&route_change.description);
-            {
-                let mut store_guard = store.write().await;
+        // Anomaly events go to the store's event deque, and the attempt's
+        // records (anomaly events first, then the traceroute record) go to
+        // the JSONL log.
+        let (records, anomalies) = trace_attempt_records(&detector, &result, &target);
+        if !anomalies.is_empty() {
+            let mut store_guard = store.write().await;
+            for anomaly in &anomalies {
                 store_guard.push_event(
                     anomaly.event_type.clone(),
                     anomaly.severity.clone(),
                     anomaly.message.clone(),
                 );
             }
-            let event_record = detector.to_event_record(&anomaly, &target);
-            let _ = log_tx.send(LogRecord::Event(event_record)).await;
         }
-
-        // Publish per-hop RTT anomalies as events (store + JSONL)
-        for hop_rtt_anomaly in &result.hop_rtt_anomalies {
-            debug!(
-                "Hop {} ({}) RTT anomaly: {:.1}ms (mean: {:.1}ms, sigma: {:.1})",
-                hop_rtt_anomaly.hop,
-                hop_rtt_anomaly
-                    .ip
-                    .map(|ip| ip.to_string())
-                    .unwrap_or_else(|| "*".to_string()),
-                hop_rtt_anomaly.rtt_ms,
-                hop_rtt_anomaly.mean,
-                hop_rtt_anomaly.sigma
-            );
-            let anomaly = detector.on_hop_rtt_anomaly(
-                hop_rtt_anomaly.hop,
-                hop_rtt_anomaly.ip,
-                hop_rtt_anomaly.rtt_ms,
-                hop_rtt_anomaly.mean,
-                hop_rtt_anomaly.sigma,
-            );
-            {
-                let mut store_guard = store.write().await;
-                store_guard.push_event(
-                    anomaly.event_type.clone(),
-                    anomaly.severity.clone(),
-                    anomaly.message.clone(),
-                );
-            }
-            let event_record = detector.to_event_record(&anomaly, &target);
-            let _ = log_tx.send(LogRecord::Event(event_record)).await;
+        for record in records {
+            let _ = log_tx.send(record).await;
         }
-
-        // One TracerouteRecord per attempt (including error attempts)
-        let hops: Vec<crate::models::HopRecord> = result
-            .hops
-            .iter()
-            .map(|h| crate::models::HopRecord {
-                hop: h.hop,
-                ip: h.ip.map(|ip| ip.to_string()),
-                rtt_ms: h.rtt_ms,
-                host: h.host.clone(),
-            })
-            .collect();
-        let record = TracerouteRecord {
-            ts: chrono::Utc::now(),
-            target: target.clone(),
-            hops,
-            hop_count: result.hop_count,
-            status: result.status.clone(),
-        };
-        let _ = log_tx.send(LogRecord::Traceroute(record)).await;
     }
 }
 
-/// Spawn a traceroute task
-#[allow(dead_code)]
-pub fn spawn_traceroute_task(
-    target: IpAddr,
-    timeout_ms: u64,
-    interval_secs: u64,
-    tx: mpsc::Sender<TracerouteRecord>,
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut prober = match TracerouteProber::new(target, timeout_ms) {
-            Ok(p) => p,
-            Err(e) => {
-                error!("Failed to create traceroute prober: {}", e);
-                return;
-            }
-        };
+/// Build the JSONL records and store events for one trace attempt
+///
+/// Pure mapping step behind the ADR-0006 contract (`specs/decisions/`):
+/// one `Event` record per anomaly (route change first, then per-hop RTT
+/// anomalies), then exactly one `Traceroute` record per attempt — failed
+/// attempts included — so the log always carries the attempt's shape. The
+/// companion [`AnomalyEvent`]s must reach the store's event deque in the
+/// same order.
+fn trace_attempt_records(
+    detector: &AnomalyDetector,
+    result: &TracerouteResult,
+    target: &str,
+) -> (Vec<LogRecord>, Vec<AnomalyEvent>) {
+    let mut records = Vec::new();
+    let mut anomalies = Vec::new();
 
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
+    // Publish route change as an anomaly event (store + JSONL)
+    if let Some(ref route_change) = result.route_change {
+        warn!("Route change detected: {}", route_change.description);
+        let anomaly = detector.on_route_change(&route_change.description);
+        anomalies.push(anomaly.clone());
+        records.push(LogRecord::Event(detector.to_event_record(&anomaly, target)));
+    }
 
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let result = prober.trace();
+    // Publish per-hop RTT anomalies as events (store + JSONL)
+    for hop_rtt_anomaly in &result.hop_rtt_anomalies {
+        debug!(
+            "Hop {} ({}) RTT anomaly: {:.1}ms (mean: {:.1}ms, sigma: {:.1})",
+            hop_rtt_anomaly.hop,
+            hop_rtt_anomaly
+                .ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "*".to_string()),
+            hop_rtt_anomaly.rtt_ms,
+            hop_rtt_anomaly.mean,
+            hop_rtt_anomaly.sigma
+        );
+        let anomaly = detector.on_hop_rtt_anomaly(
+            hop_rtt_anomaly.hop,
+            hop_rtt_anomaly.ip,
+            hop_rtt_anomaly.rtt_ms,
+            hop_rtt_anomaly.mean,
+            hop_rtt_anomaly.sigma,
+            hop_rtt_anomaly.stddev,
+        );
+        anomalies.push(anomaly.clone());
+        records.push(LogRecord::Event(detector.to_event_record(&anomaly, target)));
+    }
 
-                    // Convert HopData to HopRecord
-                    let hops: Vec<crate::models::HopRecord> = result.hops.iter().map(|h| {
-                        crate::models::HopRecord {
-                            hop: h.hop,
-                            ip: h.ip.map(|ip| ip.to_string()),
-                            rtt_ms: h.rtt_ms,
-                            host: h.host.clone(),
-                        }
-                    }).collect();
+    // One TracerouteRecord per attempt (including error attempts)
+    let hops: Vec<crate::models::HopRecord> = result
+        .hops
+        .iter()
+        .map(|h| crate::models::HopRecord {
+            hop: h.hop,
+            ip: h.ip.map(|ip| ip.to_string()),
+            rtt_ms: h.rtt_ms,
+            host: h.host.clone(),
+        })
+        .collect();
+    records.push(LogRecord::Traceroute(TracerouteRecord {
+        ts: chrono::Utc::now(),
+        target: target.to_string(),
+        hops,
+        hop_count: result.hop_count,
+        status: result.status.clone(),
+    }));
 
-                    let record = TracerouteRecord {
-                        ts: chrono::Utc::now(),
-                        target: target.to_string(),
-                        hop_count: result.hop_count,
-                        status: result.status.clone(),
-                        hops,
-                    };
-
-                    if let Err(e) = tx.send(record).await {
-                        error!("Failed to send traceroute record: {}", e);
-                        break;
-                    }
-
-                    if let Some(ref route_change) = result.route_change {
-                        warn!("Route change detected: {}", route_change.description);
-                    }
-                }
-                _ = cancel.cancelled() => {
-                    debug!("Traceroute task cancelled");
-                    break;
-                }
-            }
-        }
-    })
+    (records, anomalies)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Severity;
     use std::net::Ipv4Addr;
 
     fn hop_addr(last_octet: u8) -> Option<IpAddr> {
@@ -635,6 +660,8 @@ mod tests {
             timeout: Duration::from_secs(1),
             previous_hops: hops,
             hop_rtt_stats: HashMap::new(),
+            #[cfg(not(windows))]
+            trace_worker: None,
         }
     }
 
@@ -653,16 +680,16 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_route_change_hop_count() {
+    fn test_detect_route_change_pure_hop_count_change_no_event() {
+        // A hop-count difference alone is not a topology change: a hop
+        // appearing or going silent leaves every position where both runs
+        // have an answered IP unchanged
         let prober = prober_with_previous(vec![hop_addr(1), hop_addr(2)]);
-        let current = [hop_addr(1), hop_addr(2), hop_addr(3)];
+        let longer = [hop_addr(1), hop_addr(2), hop_addr(3)];
+        assert!(prober.detect_route_change(&longer).is_none());
 
-        let change = prober
-            .detect_route_change(&current)
-            .expect("change expected");
-        assert_eq!(change.description, "Route hop count changed from 2 to 3");
-        assert_eq!(change.old_hops, vec![hop_addr(1), hop_addr(2)]);
-        assert_eq!(change.new_hops, current.to_vec());
+        let shorter = [hop_addr(1)];
+        assert!(prober.detect_route_change(&shorter).is_none());
     }
 
     #[test]
@@ -675,29 +702,156 @@ mod tests {
             .expect("change expected");
         assert!(change.description.contains("hop 2"));
         assert!(change.description.contains("10.0.0.9"));
-        assert_eq!(change.new_hops[1], hop_addr(9));
     }
 
     #[test]
-    fn test_detect_route_change_missing_hop_ip() {
+    fn test_detect_route_change_non_answered_hop_no_event() {
+        // A hop that stops answering is "unknown", not a changed address
         let prober = prober_with_previous(vec![hop_addr(1), hop_addr(2)]);
         let current = [hop_addr(1), None];
+        assert!(prober.detect_route_change(&current).is_none());
 
-        let change = prober
-            .detect_route_change(&current)
-            .expect("change expected");
-        assert!(change.description.contains("hop 2"));
-        assert_eq!(change.new_hops[1], None);
+        // The mirror case: a previously silent hop answering is not a change
+        let prober = prober_with_previous(vec![hop_addr(1), None]);
+        let current = [hop_addr(1), hop_addr(2)];
+        assert!(prober.detect_route_change(&current).is_none());
     }
 
     #[test]
     fn test_update_target_resets_route_history() {
         let mut prober = prober_with_previous(vec![hop_addr(1), hop_addr(2)]);
+        // Seed a non-empty per-hop baseline; update_target documents that it
+        // is cleared along with the route history
+        prober
+            .hop_rtt_stats
+            .insert(hop_addr(1), WindowedWelford::hop());
         prober.update_target(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
 
         assert_eq!(prober.target, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)));
-        // History cleared: the next run is treated as a first run
+        // Both documented resets happened: route history and hop stats
+        assert!(prober.previous_hops.is_empty());
+        assert!(prober.hop_rtt_stats.is_empty());
+        // The next run is treated as a first run
         let current = [hop_addr(5), hop_addr(6)];
         assert!(prober.detect_route_change(&current).is_none());
+    }
+
+    /// A two-hop result with the given anomalies attached
+    fn result_with(
+        route_change: Option<RouteChangeInfo>,
+        hop_anomalies: Vec<HopRttAnomalyInfo>,
+        error: Option<String>,
+    ) -> TracerouteResult {
+        TracerouteResult {
+            hops: vec![
+                HopData {
+                    hop: 1,
+                    rtt_ms: Some(1.5),
+                    ip: hop_addr(1),
+                    host: None,
+                },
+                HopData {
+                    hop: 2,
+                    rtt_ms: Some(2.5),
+                    ip: hop_addr(2),
+                    host: Some("gw.example".to_string()),
+                },
+            ],
+            hop_count: 2,
+            status: if error.is_some() {
+                TracerouteStatus::Error
+            } else {
+                TracerouteStatus::Ok
+            },
+            error,
+            route_change,
+            hop_rtt_anomalies: hop_anomalies,
+        }
+    }
+
+    fn as_event(record: &LogRecord) -> &crate::models::EventRecord {
+        match record {
+            LogRecord::Event(event) => event,
+            other => panic!("expected an event record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_trace_attempt_records_clean_attempt() {
+        let detector = AnomalyDetector::new();
+        let result = result_with(None, Vec::new(), None);
+        let (records, anomalies) = trace_attempt_records(&detector, &result, "127.0.0.1");
+
+        // No anomalies: the attempt yields exactly one Traceroute record
+        assert!(anomalies.is_empty());
+        assert_eq!(records.len(), 1);
+        let LogRecord::Traceroute(record) = &records[0] else {
+            panic!("expected a traceroute record, got {:?}", records[0]);
+        };
+        assert_eq!(record.target, "127.0.0.1");
+        assert_eq!(record.hop_count, 2);
+        assert!(matches!(record.status, TracerouteStatus::Ok));
+        assert_eq!(record.hops.len(), 2);
+        assert_eq!(record.hops[0].hop, 1);
+        assert_eq!(record.hops[0].ip.as_deref(), Some("10.0.0.1"));
+        assert_eq!(record.hops[0].rtt_ms, Some(1.5));
+        assert_eq!(record.hops[1].host.as_deref(), Some("gw.example"));
+    }
+
+    #[test]
+    fn test_trace_attempt_records_error_attempt_still_recorded() {
+        let detector = AnomalyDetector::new();
+        let result = result_with(None, Vec::new(), Some("trace failed".to_string()));
+        let (records, anomalies) = trace_attempt_records(&detector, &result, "127.0.0.1");
+
+        // Failed attempts still produce exactly one Traceroute record
+        assert!(anomalies.is_empty());
+        assert_eq!(records.len(), 1);
+        let LogRecord::Traceroute(record) = &records[0] else {
+            panic!("expected a traceroute record, got {:?}", records[0]);
+        };
+        assert!(matches!(record.status, TracerouteStatus::Error));
+    }
+
+    #[test]
+    fn test_trace_attempt_records_events_precede_traceroute() {
+        let detector = AnomalyDetector::new();
+        let route_change = RouteChangeInfo {
+            description: "Route changed at hop 2: 10.0.0.2".to_string(),
+        };
+        let hop_anomaly = HopRttAnomalyInfo {
+            hop: 1,
+            ip: hop_addr(1),
+            rtt_ms: 50.0,
+            mean: 1.0,
+            stddev: 0.5,
+            sigma: 98.0,
+        };
+        let result = result_with(Some(route_change), vec![hop_anomaly], None);
+        let (records, anomalies) = trace_attempt_records(&detector, &result, "example.test");
+
+        // Route-change event, hop-RTT event, then the traceroute record
+        assert_eq!(records.len(), 3);
+        assert!(matches!(records[0], LogRecord::Event(_)));
+        assert!(matches!(records[1], LogRecord::Event(_)));
+        assert!(matches!(records[2], LogRecord::Traceroute(_)));
+
+        // The same anomalies (route change first) go to the store
+        assert_eq!(anomalies.len(), 2);
+        assert_eq!(anomalies[0].event_type, "route_change");
+        assert_eq!(anomalies[0].severity, Severity::Warning);
+        assert_eq!(anomalies[1].event_type, "hop_rtt_anomaly");
+        assert_eq!(anomalies[1].severity, Severity::Warning);
+
+        // The Event records mirror the store anomalies, in order
+        let first = as_event(&records[0]);
+        assert_eq!(first.event, anomalies[0].event_type);
+        assert_eq!(first.severity, anomalies[0].severity);
+        assert_eq!(first.message, anomalies[0].message);
+        assert_eq!(first.target, "example.test");
+        let second = as_event(&records[1]);
+        assert_eq!(second.event, anomalies[1].event_type);
+        assert_eq!(second.severity, anomalies[1].severity);
+        assert_eq!(second.message, anomalies[1].message);
     }
 }

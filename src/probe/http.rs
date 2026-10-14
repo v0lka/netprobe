@@ -5,23 +5,17 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::{Instant, timeout};
 
-/// HTTP probe status
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum HttpStatus {
-    Ok,
-    #[allow(dead_code)]
-    Error,
-}
-
 /// Result of an HTTP probe
 #[derive(Debug, Clone)]
 pub struct HttpResult {
     pub ttfb_ms: f64,
     pub total_ms: f64,
     pub status_code: u16,
-    #[allow(dead_code)]
-    pub status: HttpStatus,
 }
+
+/// Hard cap for the status-line/header read buffer. A legitimate status line
+/// and its headers never approach this size; anything larger is garbage.
+const MAX_STATUS_LINE_BUFFER: usize = 8 * 1024;
 
 /// Perform an HTTP GET request with TTFB (Time To First Byte) measurement
 /// Sends a minimal HTTP/1.1 GET request and measures:
@@ -38,10 +32,17 @@ where
 {
     let start = Instant::now();
 
+    // RFC 7230 §5.4: an IPv6 literal must be bracketed in the Host header,
+    // otherwise the raw `:` characters parse as a bogus host:port pair.
+    let host_header = match host.parse::<std::net::IpAddr>() {
+        Ok(ip) if ip.is_ipv6() => format!("[{}]", ip),
+        _ => host.to_string(),
+    };
+
     // Build minimal HTTP/1.1 GET request
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path, host
+        path, host_header
     );
 
     // Send the request with timeout
@@ -66,29 +67,52 @@ where
     let ttfb_elapsed = start.elapsed();
     let ttfb_ms = ttfb_elapsed.as_secs_f64() * 1000.0;
 
-    // Read the rest of the status line and headers
+    // Read until the status line is terminated ("\r\n" seen). The whole phase
+    // is bounded by a single overall deadline (the same timeout as the
+    // request/TTFB) and a hard buffer cap, so a peer that trickles bytes
+    // forever can neither grow the buffer unboundedly nor stall the probe.
     let mut buffer = vec![first_byte_buffer[0]];
     let mut temp_buffer = [0u8; 1024];
 
-    // Read until we get the full status line (ends with \r\n)
-    loop {
-        match timeout(Duration::from_millis(100), stream.read(&mut temp_buffer)).await {
-            Ok(Ok(0)) => break, // Connection closed
-            Ok(Ok(n)) => {
-                buffer.extend_from_slice(&temp_buffer[..n]);
-                // Check if we have the status line
-                if buffer.windows(2).any(|w| w == b"\r\n") {
-                    break;
+    // Returns whether the status line was terminated; `false` means the
+    // connection closed mid-status-line (a truncated response).
+    let read_status_line = async {
+        loop {
+            match stream.read(&mut temp_buffer).await {
+                Ok(0) => return Ok(false),
+                Ok(n) => {
+                    buffer.extend_from_slice(&temp_buffer[..n]);
+                    // Check if we have the full status line
+                    if buffer.windows(2).any(|w| w == b"\r\n") {
+                        return Ok(true);
+                    }
+                    // Reject oversized/garbage responses instead of buffering forever
+                    if buffer.len() > MAX_STATUS_LINE_BUFFER {
+                        return Err(ProbeError::ParseError(
+                            "Response exceeded status-line buffer limit".to_string(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(ProbeError::SocketError(format!("Read error: {}", e)));
                 }
             }
-            Ok(Err(e)) => {
-                return Err(ProbeError::SocketError(format!("Read error: {}", e)));
-            }
-            Err(_) => {
-                // Timeout reading headers, but we already have TTFB
-                break;
-            }
         }
+    };
+
+    // Only a terminated status line is parsed: parsing a truncated one could
+    // fabricate a bogus status code (e.g. "HTTP/1.1 5" → 5).
+    let status_line_terminated = match timeout(timeout_duration, read_status_line).await {
+        Ok(outcome) => outcome?,
+        // Overall deadline elapsed without a complete status line: the attempt
+        // is a timeout. The TTFB captured above is discarded with the failed
+        // attempt, like any other probe error.
+        Err(_) => return Err(ProbeError::Timeout),
+    };
+    if !status_line_terminated {
+        return Err(ProbeError::ParseError(
+            "Connection closed before the status line was complete".to_string(),
+        ));
     }
 
     let total_elapsed = start.elapsed();
@@ -101,7 +125,6 @@ where
         ttfb_ms,
         total_ms,
         status_code,
-        status: HttpStatus::Ok,
     })
 }
 
@@ -202,18 +225,10 @@ mod tests {
             ttfb_ms: 78.4,
             total_ms: 82.1,
             status_code: 200,
-            status: HttpStatus::Ok,
         };
 
         assert_eq!(result.ttfb_ms, 78.4);
         assert_eq!(result.total_ms, 82.1);
         assert_eq!(result.status_code, 200);
-        assert_eq!(result.status, HttpStatus::Ok);
-    }
-
-    #[test]
-    fn test_http_status_enum() {
-        assert_eq!(HttpStatus::Ok, HttpStatus::Ok);
-        assert_ne!(HttpStatus::Ok, HttpStatus::Error);
     }
 }

@@ -22,7 +22,7 @@ Defines the dashboard's vertical stack (`DashboardLayout`), the per-panel widget
 `DashboardLayout::new(area)` decides visibility from the terminal size; `build()` returns seven areas:
 
 ```
-Full (height ≥ 24):                 Compact (height < 24):
+Full (height ≥ 24):                 Short (height < 24):
 ┌ Header (1 row) ┐                  ┌ Header (1 row) ┐
 │ Ping     32%   │                  │ Ping     45%   │
 │ DNS      13%   │                  │ DNS      20%   │
@@ -40,10 +40,10 @@ Full (height ≥ 24):                 Compact (height < 24):
 
 | Panel | Reads (all read-only from `MetricsStore`) |
 | ----- | ----------------------------------------- |
-| `HeaderWidget` | `target`, `resolved_target`, MOS/grade (recomputed from aggregates), session duration, active IP info |
-| `PingPanel` | `icmp_rtt_history` (braille sparkline), `icmp_aggregates` (now/avg/min/max/p95/jitter/loss/sent/recv/dup/reordered) |
+| `HeaderWidget` | `target`, resolved IP (with active index), MOS/grade (recomputed from aggregates), session duration |
+| `PingPanel` | `icmp_rtt_history` (braille sparkline), `icmp_aggregates` (now/avg/min/max/p95/jitter/loss/sent/recv) |
 | `DnsPanel` | `latest_dns` (`DnsData` or error), `dns_resolve_history` sparkline |
-| `TcpTlsPanel` | `latest_tcp`, `latest_tls` (version, cipher, cert days), `latest_http` (TTFB, status), respective histories |
+| `TcpTlsPanel` | `latest_tcp`, `latest_tls` (version, cipher, cert days), `latest_http` (TTFB, status), `tcp_connect_history` (sparkline) |
 | `TracePanel` | `latest_traceroute` (`TracerouteData.hops`), `traceroute_available`; hop bars + per-hop scroll (`trace_scroll`, focus highlight) |
 | `EventsPanel` | `events()` deque, severity-colored, scroll + auto-scroll (stick to newest until user scrolls) |
 | `LogsPanel` | `logs()` deque (tracing entries), scroll + auto-scroll |
@@ -54,15 +54,19 @@ Panels taking a `compact: bool` (Ping) or `port` (TcpTlsPanel) receive it from `
 ## Behavior
 
 - **Scroll model**: each scrollable panel keeps an offset in `TuiApp` plus an `auto_scroll` flag. Scrolling manually turns auto-scroll off; the flag resets per panel implementation to stick to the newest entry. `Tab` moves focus; the focused panel draws a focus indicator and receives `↑`/`↓`.
-- **Error rendering**: when a `ProbeResult` slot carries `error`, the panel shows the error text instead of metrics (e.g. trace panel shows the "Insufficient privileges" message).
 - **Help popup**: `?` toggles a centered 60%×60% overlay (`Clear` + rounded border) listing hotkeys; `Esc` closes.
+
+## Error Handling
+
+- When a `ProbeResult` slot carries `error`, the owning panel shows the error text instead of metrics (e.g. the trace panel shows the "Insufficient privileges" message); panels render empty states for `None`/empty slices and never unwrap.
+- Terminal-level failures (setup, draw, event read) propagate out of `run_tui` to `main`; the panic hook restores the terminal before delegating for panics located under `src/tui/`, and any panic unwinding through `run()` restores it via `TerminalGuard`. Error rendering never writes back to the store.
 
 ## Invariants
 
 1. Layout thresholds are compile-time constants (`MIN_HEIGHT_FULL = 24`, `MIN_WIDTH_FULL = 80`) applied identically to both constraint branches.
 2. The full branch always emits the 7-constraint sequence header/ping/dns/tcp/trace/events/footer; the compact branch header/ping/dns/tcp/footer.
 3. Panel widgets are stateless — all interactive state (scroll, focus, help) lives in `TuiApp`.
-4. No panel mutates the store; frame rendering depends only on the store snapshot and `TuiApp` state.
+4. Panels only read the store; frame rendering depends only on the store snapshot and `TuiApp` state — store writes come exclusively from `TuiApp`'s `r`/`n`/`p` handlers.
 
 ## Related Specs
 

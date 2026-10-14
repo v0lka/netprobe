@@ -12,9 +12,9 @@ Supports Linux, macOS, and Windows.
 - **ICMP Ping Monitoring** - Continuous latency measurement with packet loss detection, jitter calculation, MOS (Mean Opinion Score) grading, and duplicate/reorder detection
 - **DNS Resolution Tracking** - Periodic DNS lookups with resolution time measurement, TTL monitoring, multi-IP support, and DNS change detection
 - **TCP/TLS/HTTP Probing** - Connection establishment timing, TLS handshake analysis with certificate details (expiry, SAN, issuer), and HTTP response metrics (TTFB, status codes)
-- **Traceroute Analysis** - Hop-by-hop path visualization with RTT measurements and hostname resolution
+- **Traceroute Analysis** - Hop-by-hop path visualization with RTT measurements (the hop `host` field is populated on Windows only)
 - **Interactive TUI Dashboard** - Real-time visualization with sparklines, statistics panels, keyboard navigation, and IP switching for multi-homed hosts
-- **Anomaly Detection** - Automatic detection of RTT spikes, jitter spikes, loss bursts, DNS changes, and certificate expiry warnings
+- **Anomaly Detection** - Automatic detection of RTT spikes, jitter spikes, loss bursts, DNS changes, HTTP errors, TCP refusals, route changes, hop RTT anomalies, and certificate expiry warnings
 - **Structured Logging** - JSONL output with session start/end records for analysis and auditing
 - **Quiet Mode** - Background operation without TUI for automated monitoring
 - **Customizable Intervals** - Configurable probe frequencies and timeouts for all check types
@@ -35,7 +35,7 @@ netprobe example.com -q --log output.jsonl
 # Custom HTTP path and port
 netprobe example.com --port 8080 --http-path /health
 
-# Disable HTTP probing, ICMP only
+# Disable the HTTP health-check
 netprobe example.com --no-http
 
 # Use plain HTTP instead of HTTPS
@@ -53,7 +53,7 @@ netprobe example.com --interval-icmp 500 --interval-dns 60
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/netprobe
+git clone https://github.com/v0lka/netprobe
 cd netprobe
 cargo build --release
 ```
@@ -62,7 +62,7 @@ The binary will be available at `target/release/netprobe`.
 
 ### Privileges
 
-Traceroute functionality requires raw socket access. Without elevated privileges, netprobe will run but traceroute will be disabled.
+On Linux and macOS, traceroute functionality requires raw socket access. Without elevated privileges, netprobe will run but traceroute will be disabled. On Windows, traceroute uses `tracert.exe` and does not require elevated privileges.
 
 **Linux:**
 ```bash

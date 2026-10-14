@@ -13,7 +13,8 @@ Single-writer JSONL persistence: every probe result, anomaly event, and session 
 ## Core Types
 
 ```rust
-// src/models.rs — one enum, externally tagged via serde
+// src/models.rs — one enum, internally tagged via serde
+// (the discriminant is a field inside the record object, not a wrapper)
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LogRecord {
     Icmp(IcmpRecord), Dns(DnsRecord), Tcp(TcpRecord), Tls(TlsRecord),
@@ -26,12 +27,29 @@ pub struct Logger { writer: BufWriter<tokio::fs::File> }
 impl Logger {
     pub const CHANNEL_BUFFER_SIZE: usize = 1024;
     pub const FLUSH_INTERVAL_SECS: u64 = 5;
-    pub async fn new(path: &Path) -> Result<(Self, mpsc::Sender<LogRecord>)>;
+    pub async fn new(path: &Path) -> Result<(Self, mpsc::Sender<LogRecord>, mpsc::Receiver<LogRecord>)>;
     pub async fn run(self, rx: mpsc::Receiver<LogRecord>, cancel: CancellationToken) -> Result<()>;
 }
 ```
 
-`Logger::new` creates/truncates the file. `run` is the writer loop: receive → `serde_json::to_string` → `write_all` + `\n`.
+`Logger::new` creates/truncates the file and owns the mpsc channel (returns writer, sender, and receiver for `app.rs` to wire up). `run` is the writer loop: receive → `serde_json::to_string` → `write_all` + `\n`.
+
+## Flow
+
+```
+probe loop ──▶ log_tx.send(LogRecord) ──▶ mpsc channel (buffer 1024)
+                                              │
+              app.rs: session_start/session_end ┘
+                                              ▼
+        Logger::run: rx.recv() ─▶ serde_json::to_string ─▶ BufWriter<File>::write_all + '\n'
+                                              │ flush points:
+                                              ├─▶ Event record received → immediate flush()
+                                              ├─▶ 5 s tick → flush if dirty
+                                              ├─▶ cancel fired (once) → flush, keep draining
+                                              └─▶ channel closed → final flush, exit
+```
+
+Readers are external tailers only — nothing in-process reads the file back.
 
 ## Behavior
 
@@ -60,14 +78,14 @@ impl Logger {
 - `TracerouteStatus`: `ok | error` (one `traceroute` record per attempt — see [probing/traceroute.md](probing/traceroute.md))
 - `Severity`: `info | warning | critical`
 
-`Option` fields serialize as JSON `null` when absent (e.g. `rtt_ms` on timeout, TLS fields on handshake failure).
+`Option` fields have their JSON keys **omitted entirely** when absent (`#[serde(skip_serializing_if = "Option::is_none")]` — e.g. `rtt_ms` on timeout, TLS fields on handshake failure). A consumer must not assume these keys are present; absence means "no value".
 
 ### Tracing (diagnostics) vs JSONL (data)
 
 The `tracing` subsystem is separate from JSONL logging:
 
-- Quiet mode: `tracing_subscriber::fmt` to stderr.
-- TUI mode: `TuiTracingLayer` (`src/tui_tracing.rs`) captures spans/events into a `TracingLogReceiver`; a consumer task forwards them to `store.push_log_event` → logs deque → TUI logs panel. Tracing output never enters the JSONL file.
+- Quiet mode: `tracing_subscriber::fmt().with_writer(std::io::stderr)` — diagnostics go to stderr, keeping stdout clean.
+- TUI mode: `TuiTracingLayer` (`src/tui_tracing.rs`) captures tracing **events** (no span callbacks) into a `TracingLogReceiver`; a consumer task forwards them to `store.push_log_event` → logs deque → TUI logs panel. Tracing output never enters the JSONL file.
 
 ## Invariants
 
@@ -79,7 +97,7 @@ The `tracing` subsystem is separate from JSONL logging:
 
 ## Configuration
 
-- Log path: `--log <PATH>`; default `./netprobe-<target>-<unix-timestamp>.jsonl` (built in `main.rs::into_config`).
+- Log path: `--log <PATH>`; default `./netprobe-<sanitized-target>-<unix-timestamp>.jsonl` (built in `main.rs::into_config`, which replaces target characters outside `A-Za-z0-9._-` with `_`).
 - Channel buffer: 1024 records (`CHANNEL_BUFFER_SIZE`); a full channel makes senders await (natural backpressure) — probes block on send, not drop.
 - Flush interval: 5 s (compile-time constant).
 

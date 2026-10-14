@@ -4,7 +4,7 @@ Instructions for AI coding agents working in this repository.
 
 ## Project
 
-netprobe — a Rust console utility for deep network connection-quality monitoring with a btop-style TUI dashboard and structured JSONL logging. It monitors a single target across four layers (ICMP, DNS, TCP/TLS/HTTP) plus traceroute. Linux, macOS, Windows; Rust edition 2024; ratatui + crossterm + tokio.
+netprobe — a Rust console utility for deep network connection-quality monitoring with a btop-style TUI dashboard and structured JSONL logging. It monitors a single target across four layers — ICMP, DNS, TCP/TLS/HTTP, and traceroute. Linux, macOS, Windows; Rust edition 2024; ratatui + crossterm + tokio.
 
 ## Build & Verify
 
@@ -35,6 +35,6 @@ Rules:
 ## Conventions
 
 - Rust edition 2024, single crate, `cargo fmt`/`clippy -D warnings` clean.
-- Probe errors are never fatal — statuses/events, not panics; only startup failures (log file, ICMP init, DNS resolve) abort with `anyhow`.
-- One JSONL record per probe attempt, schemas owned solely by `src/models.rs`.
-- The TUI reads the shared store; it never writes metrics or calls probers directly.
+- Probe errors are never fatal — statuses/events, not panics; only startup failures (log file, DNS resolve) abort with `anyhow` (ICMP prober construction is infallible — it falls back to the `subprocess` strategy).
+- One JSONL record per probe attempt per stage, schemas owned solely by `src/models.rs`.
+- The TUI reads the shared store read-only except for the `r` reset and the `n`/`p` IP-cycle accessors (each under a write lock); it never calls probers directly.

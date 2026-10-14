@@ -29,7 +29,7 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, mpsc, watch};
+use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
@@ -58,11 +58,10 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
         all_ips.len()
     );
 
-    // Step 2: Determine ICMP strategy
+    // Step 2: Determine ICMP strategy. Construction is infallible: it falls
+    // back to the subprocess strategy when no socket client can be created.
     let icmp_timeout = Duration::from_millis(config.timeout_icmp_ms);
-    let (icmp_prober, icmp_strategy) = IcmpProber::new(target_ip, icmp_timeout)
-        .await
-        .context("Failed to initialize ICMP prober")?;
+    let (icmp_prober, icmp_strategy) = IcmpProber::new(target_ip, icmp_timeout).await;
     info!("ICMP strategy: {}", icmp_strategy);
 
     // Step 3: Check privileges for traceroute
@@ -83,18 +82,19 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
     {
         let mut store_guard = store.write().await;
         store_guard.set_resolved_target(resolved_target.clone());
-        store_guard.set_resolved_ip(Some(target_ip.to_string()));
-        store_guard.set_resolved_ips(all_ips);
+        // Keep the store's active IP in sync with the address the probes
+        // actually use (the preferred IPv4), not just the first resolved
+        // address, so the header and the n/p cycle start from the probed IP
+        store_guard.set_resolved_ips_with_active(all_ips, Some(target_ip));
         store_guard.set_traceroute_available(traceroute_available);
     }
 
-    // Step 5: Create logger and channel
-    let (logger, _log_tx) = Logger::new(&config.log_path)
+    // Step 5: Create logger and the pipeline channel. Logger::new owns the
+    // channel creation: the sender feeds all probe loops, the receiver is
+    // passed to Logger::run below.
+    let (logger, log_sender, log_receiver) = Logger::new(&config.log_path)
         .await
         .context("Failed to create logger")?;
-
-    // Create a channel for the logger task
-    let (log_sender, log_receiver) = mpsc::channel::<LogRecord>(Logger::CHANNEL_BUFFER_SIZE);
 
     // Step 6: Write session_start record
     let session_start = SessionStartRecord {
@@ -118,9 +118,12 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
         .await
         .context("Failed to send session_start record")?;
 
-    // Step 7: Create cancellation token, traceroute notify, and IP change channel
+    // Step 7: Create cancellation token, traceroute notify, IP change channel,
+    // and statistics-reset notify (the ICMP anomaly detector re-warms when
+    // the store's statistics are reset)
     let cancel = CancellationToken::new();
     let trace_notify = Arc::new(Notify::new());
+    let reset_notify = Arc::new(Notify::new());
     let (ip_change_tx, ip_change_rx) = watch::channel(target_ip);
 
     // Step 8: Spawn logger task
@@ -162,6 +165,7 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
     let icmp_target = config.target.clone();
     let icmp_interval = config.interval_icmp_ms;
     let icmp_ip_rx = ip_change_rx.clone();
+    let icmp_reset_notify = reset_notify.clone();
 
     let icmp_handle = tokio::spawn(async move {
         if let Err(e) = icmp_probe_loop(
@@ -172,6 +176,7 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
             icmp_target,
             icmp_cancel,
             icmp_ip_rx,
+            icmp_reset_notify,
         )
         .await
         {
@@ -276,6 +281,7 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
             config.clone(),
             tui_cancel,
             trace_notify,
+            reset_notify,
             ip_change_tx,
         )
         .await
@@ -291,15 +297,23 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
 
     // Wait for all probe tasks to complete with timeout
     let task_names = ["ICMP", "DNS", "TCP", "Traceroute"];
-    for (i, handle) in handles.into_iter().enumerate() {
+    for (i, mut handle) in handles.into_iter().enumerate() {
         let task_name = task_names.get(i).unwrap_or(&"Unknown");
         tracing::debug!("Waiting for {} task to complete...", task_name);
-        match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
-            Ok(_) => tracing::debug!("{} task completed", task_name),
-            Err(_) => warn!(
-                "{} task did not complete within timeout, continuing...",
-                task_name
-            ),
+        // Borrow the handle so it survives the timeout: an overrunning task
+        // is aborted below instead of detached, so it cannot send a record
+        // after `session_end` and its sender clone cannot keep the log
+        // channel open past this point.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), &mut handle).await {
+            Ok(Ok(())) => tracing::debug!("{} task completed", task_name),
+            Ok(Err(e)) => error!("{} task panicked: {}", task_name, e),
+            Err(_) => {
+                warn!(
+                    "{} task did not complete within timeout; aborting so no record can follow session_end",
+                    task_name
+                );
+                handle.abort();
+            }
         }
     }
 
@@ -338,19 +352,11 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
 async fn resolve_target(config: &Config) -> Result<(IpAddr, Option<String>, Vec<IpAddr>)> {
     // First, try to parse as IP address
     if let Ok(ip) = IpAddr::from_str(&config.target) {
-        // Try reverse DNS lookup for IP addresses
-        let resolver = create_resolver(
-            config.dns_server,
-            Duration::from_millis(config.timeout_dns_ms),
-        )
-        .context("Failed to create DNS resolver for reverse lookup")?;
-
-        let reverse_result = resolver.reverse_lookup(ip).await;
-        let hostname = reverse_result
-            .ok()
-            .and_then(|lookup| lookup.iter().next().map(|name| name.to_string()));
-
-        return Ok((ip, hostname, vec![ip]));
+        // No reverse-DNS (PTR) lookup for IP-literal targets: its only
+        // consumer is the optional `resolved_target` JSONL field, and an
+        // unbounded PTR wait against a blackholed in-addr.arpa path stalls
+        // startup for up to ~2 × --timeout-dns before anything appears.
+        return Ok((ip, None, vec![ip]));
     }
 
     // It's a domain name, resolve it
@@ -392,10 +398,14 @@ fn create_resolver(dns_server: Option<IpAddr>, timeout: Duration) -> Result<Toki
         opts.attempts = 2;
         (config, opts)
     } else {
-        let mut opts = ResolverOpts::default();
+        // Use the system resolver configuration (e.g. /etc/resolv.conf on
+        // Unix, the registry on Windows). `ResolverConfig::default()` is
+        // Google Public DNS in hickory 0.25, not the system config.
+        let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()
+            .context("Failed to read system DNS configuration (pass --dns-server to override)")?;
         opts.timeout = timeout;
         opts.attempts = 2;
-        (ResolverConfig::default(), opts)
+        (config, opts)
     };
 
     Ok(
@@ -410,6 +420,15 @@ async fn run_quiet_mode(cancel: CancellationToken) -> Result<()> {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("Received Ctrl+C, shutting down...");
+            // Tokio's SIGINT handler stays installed for the process
+            // lifetime, so without a live listener a second Ctrl+C during
+            // the (bounded) shutdown window would be swallowed. Arm a
+            // watchdog that force-exits on the next one.
+            tokio::spawn(async {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    std::process::exit(130);
+                }
+            });
             cancel.cancel();
         }
         _ = cancel.cancelled() => {
@@ -427,18 +446,20 @@ async fn create_session_end_record(store: &SharedStore, config: &Config) -> Sess
     let duration_sec = duration.num_seconds().max(0) as u64;
 
     let aggregates = store_guard.icmp_aggregates();
-    let events = store_guard.events();
 
     // Calculate MOS and grade
     let mos = compute_mos(aggregates.avg_rtt, aggregates.jitter, aggregates.loss_pct);
     let grade = mos_to_grade(mos);
 
-    // Calculate uptime percentage
+    // Calculate uptime percentage (clamped: a transient received > sent
+    // inconsistency from a reset racing an in-flight result must not report
+    // >100% uptime)
     let uptime_pct = if aggregates.sent > 0 {
         (aggregates.received as f64 / aggregates.sent as f64) * 100.0
     } else {
         100.0
-    };
+    }
+    .clamp(0.0, 100.0);
 
     SessionEndRecord {
         ts: chrono::Utc::now(),
@@ -453,7 +474,9 @@ async fn create_session_end_record(store: &SharedStore, config: &Config) -> Sess
             uptime_pct,
             mos,
             grade,
-            events_total: events.len() as u64,
+            // True total: the store's events deque is bounded (FIFO evicts
+            // at 200), so its length would silently undercount
+            events_total: store_guard.events_total(),
         },
     }
 }
@@ -461,32 +484,80 @@ async fn create_session_end_record(store: &SharedStore, config: &Config) -> Sess
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Severity;
 
-    #[test]
-    fn test_create_session_end_record_structure() {
-        // This test verifies the structure matches the spec
-        let summary = SessionSummary {
-            icmp_sent: 100,
-            icmp_received: 95,
-            loss_pct: 5.0,
-            rtt_avg_ms: 20.5,
-            rtt_p95_ms: 45.2,
-            uptime_pct: 95.0,
-            mos: 3.8,
-            grade: 'B',
-            events_total: 3,
-        };
+    #[tokio::test]
+    async fn test_create_session_end_record_derives_summary() {
+        // Drive the real derivation: populate a store, call
+        // create_session_end_record, and assert the derived numbers.
+        let store: SharedStore = Arc::new(tokio::sync::RwLock::new(MetricsStore::new(
+            100,
+            "1.1.1.1".to_string(),
+        )));
 
-        let record = SessionEndRecord {
-            ts: chrono::Utc::now(),
+        {
+            let mut store = store.write().await;
+            // 10 sent, 8 received -> loss 20%, uptime 80%
+            for i in 0..10 {
+                store.inc_icmp_sent();
+                if i < 8 {
+                    store.push_icmp_rtt(10.0 + i as f64);
+                }
+            }
+            store.push_event(
+                "rtt_spike".to_string(),
+                Severity::Warning,
+                "RTT spike detected".to_string(),
+            );
+            store.push_event(
+                "loss_burst".to_string(),
+                Severity::Critical,
+                "Loss burst".to_string(),
+            );
+        }
+
+        let config = Config {
             target: "1.1.1.1".to_string(),
-            duration_sec: 3600,
-            summary,
+            log_path: std::path::PathBuf::from("/tmp/test.jsonl"),
+            port: 443,
+            http_path: "/".to_string(),
+            no_http: false,
+            no_tls: false,
+            interval_icmp_ms: 1000,
+            interval_dns_sec: 30,
+            interval_tcp_sec: 10,
+            interval_trace_sec: 60,
+            history: 100,
+            timeout_icmp_ms: 2000,
+            timeout_tcp_ms: 5000,
+            timeout_dns_ms: 5000,
+            timeout_http_ms: 10000,
+            timeout_trace_ms: 30000,
+            dns_server: None,
+            quiet: false,
         };
 
-        assert_eq!(record.duration_sec, 3600);
-        assert_eq!(record.summary.icmp_sent, 100);
-        assert_eq!(record.summary.icmp_received, 95);
-        assert_eq!(record.summary.grade, 'B');
+        let record = create_session_end_record(&store, &config).await;
+
+        assert_eq!(record.target, "1.1.1.1");
+        assert_eq!(record.summary.icmp_sent, 10);
+        assert_eq!(record.summary.icmp_received, 8);
+        assert!((record.summary.loss_pct - 20.0).abs() < 0.001);
+        assert!((record.summary.uptime_pct - 80.0).abs() < 0.001);
+        // avg of 10..=17
+        assert!((record.summary.rtt_avg_ms - 13.5).abs() < 0.001);
+        // True event total (the bounded deque would also hold 2 here, but the
+        // summary must come from the unbounded counter)
+        assert_eq!(record.summary.events_total, 2);
+        // Session started inside the test, so the duration floors at 0
+        assert_eq!(record.duration_sec, 0);
+        // MOS/grade are consistently derived from the same aggregates
+        let expected_mos = compute_mos(
+            record.summary.rtt_avg_ms,
+            store.read().await.icmp_aggregates().jitter,
+            record.summary.loss_pct,
+        );
+        assert!((record.summary.mos - expected_mos).abs() < 0.001);
+        assert_eq!(record.summary.grade, mos_to_grade(record.summary.mos));
     }
 }

@@ -16,7 +16,7 @@ ICMP echo requires socket privileges that vary by OS, kernel version, and sysctl
 2. `surge-ping` client with `SOCK_RAW` (`Type::RAW`) → `IcmpStrategy::Raw`
 3. system `ping` subprocess (`ping -c 1 -W` Unix / `ping -n 1 -w` Windows, output parsed by regex) → `IcmpStrategy::Subprocess`
 
-The chosen strategy is reported in `session_start.config.icmp_strategy` and shown in the TUI. The three strategies share one `IcmpResult` shape, so the probe loop and anomaly detection are strategy-agnostic.
+The chosen strategy is reported in `session_start.config.icmp_strategy`; the startup `info!` line about the strategy surfaces transiently in the TUI logs panel (via `TuiTracingLayer`), and no dashboard element renders it. The three strategies share one `IcmpResult` shape, so the probe loop and anomaly detection are strategy-agnostic.
 
 ## Consequences
 

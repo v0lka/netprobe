@@ -141,7 +141,10 @@ mod tests {
     fn create_test_store() -> MetricsStore {
         let mut store = MetricsStore::new(100, "1.1.1.1".to_string());
         store.set_resolved_target(Some("one.one.one.one".to_string()));
-        store.set_resolved_ip(Some("1.1.1.1".to_string()));
+        store.set_resolved_ips_with_active(
+            vec!["1.1.1.1".parse().unwrap(), "1.0.0.1".parse().unwrap()],
+            Some("1.1.1.1".parse().unwrap()),
+        );
 
         // Add some sample data
         for _ in 0..10 {
@@ -158,8 +161,14 @@ mod tests {
         let theme = Theme::new();
         let widget = HeaderWidget::new(&store, &theme);
 
-        // Just verify it doesn't panic
-        let _mos = widget.calculate_mos();
+        // 10 replies at 20 ms, no loss/jitter → MOS must land in the
+        // excellent range, not just "not panic".
+        let mos = widget.calculate_mos();
+        assert!(
+            (4.0..=4.5).contains(&mos),
+            "expected excellent MOS for 20ms/0/0, got {}",
+            mos
+        );
     }
 
     #[test]
@@ -206,7 +215,10 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         let content: String = buffer.content.iter().map(|c| c.symbol()).collect();
 
-        // The header now shows resolved IP, not hostname
-        assert!(content.contains("1.1.1.1"));
+        // With two resolved IPs and the first one active, the header shows
+        // the active IP plus the (index/total) suffix — a form only the
+        // resolved-IP branch can produce (the bare target would satisfy a
+        // plain "1.1.1.1" assertion).
+        assert!(content.contains("(1.1.1.1 1/2)"));
     }
 }

@@ -3,7 +3,6 @@
 /// Compute jitter as mean absolute difference between consecutive RTT values
 /// Formula: mean(|rtt[i] - rtt[i-1]|)
 /// Returns 0.0 if less than 2 samples
-#[allow(dead_code)]
 pub fn compute_jitter(rtt_history: &[f64]) -> f64 {
     if rtt_history.len() < 2 {
         return 0.0;
@@ -28,6 +27,11 @@ pub fn compute_jitter(rtt_history: &[f64]) -> f64 {
 pub fn compute_mos(avg_rtt: f64, jitter: f64, loss_pct: f64) -> f64 {
     let effective_latency = avg_rtt + jitter * 2.0 + 10.0;
     let r = 93.2 - (effective_latency / 40.0) - (loss_pct * 2.5);
+
+    // The G.107 polynomial is only valid for R in [0, 100]. Without this
+    // clamp, heavy loss drives R negative and the cubic term turns
+    // positive again — a dead target would grade "A".
+    let r = r.clamp(0.0, 100.0);
 
     let mos = 1.0 + 0.035 * r + 0.000007 * r * (r - 60.0) * (100.0 - r);
 
@@ -64,43 +68,21 @@ pub fn format_duration(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
 }
 
-/// Calculate percentile from a slice of values
-/// Note: This function sorts the data, so pass a clone if you need to preserve order
-#[allow(dead_code)]
+/// Calculate a percentile of a slice of values.
+///
+/// This is a lower-index quantile: the rank is `index = (p * (n - 1)) as usize`
+/// into the ascending order (not the textbook nearest-rank `ceil(p * n)`).
+/// Uses partial selection (O(n) average) instead of a full sort, and a total
+/// order (`total_cmp`) so a `NaN` sample cannot panic the comparison.
 pub fn calculate_percentile(values: &[f64], percentile: f64) -> f64 {
     if values.is_empty() {
         return 0.0;
     }
 
-    let mut sorted: Vec<f64> = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-    let index = (percentile * (sorted.len() - 1) as f64) as usize;
-    sorted[index]
-}
-
-/// Calculate mean of a slice
-#[allow(dead_code)]
-pub fn calculate_mean(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return 0.0;
-    }
-
-    let sum: f64 = values.iter().sum();
-    sum / values.len() as f64
-}
-
-/// Calculate standard deviation of a slice
-#[allow(dead_code)]
-pub fn calculate_stddev(values: &[f64]) -> f64 {
-    if values.len() < 2 {
-        return 0.0;
-    }
-
-    let mean = calculate_mean(values);
-    let variance: f64 =
-        values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
-    variance.sqrt()
+    let mut owned: Vec<f64> = values.to_vec();
+    let index = (percentile * (owned.len() - 1) as f64) as usize;
+    owned.select_nth_unstable_by(index, |a, b| a.total_cmp(b));
+    owned[index]
 }
 
 #[cfg(test)]
@@ -226,12 +208,29 @@ mod tests {
         // Very good connection should give MOS close to maximum
         let mos = compute_mos(0.0, 0.0, 0.0);
         // MOS is clamped to 4.5 at the upper bound
-        assert!(mos <= 4.5, "MOS should be <= 4.5, got {}", mos);
+        assert!(mos <= 4.5, "MOS should be <= 4.5, got {mos}");
         assert!(
             mos > 4.0,
-            "Perfect connection should have MOS > 4.0, got {}",
-            mos
+            "Perfect connection should have MOS > 4.0, got {mos}"
         );
+    }
+
+    #[test]
+    fn test_compute_mos_high_loss_grades_f() {
+        // Regression: R must be clamped to [0, 100] before the G.107
+        // polynomial. Without the clamp the cubic term turns positive for
+        // R < 0 and heavy loss grades "A / Excellent".
+        for loss in [60.0, 80.0, 100.0] {
+            let mos = compute_mos(0.0, 0.0, loss);
+            assert!(mos < 2.5, "{loss}% loss must grade F, got MOS {mos}");
+            assert_eq!(mos_to_grade(mos), 'F');
+        }
+
+        // Monotonicity: more loss never improves the score.
+        let m30 = compute_mos(0.0, 0.0, 30.0);
+        let m60 = compute_mos(0.0, 0.0, 60.0);
+        let m100 = compute_mos(0.0, 0.0, 100.0);
+        assert!(m100 <= m60 && m60 <= m30);
     }
 
     #[test]
@@ -311,34 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_mean() {
-        let data = vec![10.0, 20.0, 30.0];
-        assert_eq!(calculate_mean(&data), 20.0);
-    }
-
-    #[test]
-    fn test_calculate_mean_empty() {
-        let data: Vec<f64> = vec![];
-        assert_eq!(calculate_mean(&data), 0.0);
-    }
-
-    #[test]
-    fn test_calculate_stddev() {
-        let data = vec![2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0];
-        let stddev = calculate_stddev(&data);
-        // Population stddev of this data is approximately 2.0
-        assert!((stddev - 2.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn test_calculate_stddev_single() {
-        let data = vec![5.0];
-        assert_eq!(calculate_stddev(&data), 0.0);
-    }
-
-    #[test]
-    fn test_calculate_stddev_empty() {
-        let data: Vec<f64> = vec![];
-        assert_eq!(calculate_stddev(&data), 0.0);
+    fn test_calculate_percentile_nan_safe() {
+        // A NaN sample must not panic the ordering (total_cmp, not partial_cmp)
+        let data = vec![10.0, f64::NAN, 30.0];
+        let _ = calculate_percentile(&data, 0.5);
     }
 }

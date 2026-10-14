@@ -210,7 +210,7 @@ impl<'a> Widget for TcpTlsPanel<'a> {
         }
 
         // Render TLS/HTTP details row
-        if chunks[2].width > 0 && chunks.len() >= 3 {
+        if chunks.len() >= 3 && chunks[2].width > 0 {
             let mut spans = vec![];
 
             if let Some(ref data) = latest_tls.data {
@@ -306,7 +306,6 @@ impl<'a> TcpTlsPanel<'a> {
 mod tests {
     use super::*;
     use crate::store::{HttpData, MetricsStore, TcpData, TlsData};
-    use chrono::Utc;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -325,10 +324,6 @@ mod tests {
                 handshake_ms: 42.3,
                 version: "TLSv1.3".to_string(),
                 cipher: "TLS_AES_256_GCM_SHA384".to_string(),
-                cert_subject: "CN=one.one.one.one".to_string(),
-                cert_issuer: "CN=DigiCert".to_string(),
-                cert_san: vec!["one.one.one.one".to_string()],
-                cert_expiry: Utc::now() + chrono::Duration::days(89),
                 cert_days_remaining: 89,
             }),
             None,

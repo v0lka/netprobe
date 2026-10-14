@@ -1,7 +1,7 @@
 //! TLS handshake prober
 
 use crate::probe::ProbeError;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::net::TcpStream as TokioTcpStream;
 use tokio::time::{Instant, timeout};
@@ -10,13 +10,25 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::rustls::{ClientConfig, pki_types::ServerName};
 use x509_parser::prelude::*;
 
-/// TLS connection status
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TlsStatus {
-    Ok,
-    #[allow(dead_code)]
-    Error,
-}
+/// TLS client configuration (crypto provider + webpki root store), built once
+/// and shared by every handshake. Rebuilding the root set per probe is pure
+/// overhead on the hot path.
+static CLIENT_CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
+    // Use ring as the crypto provider (first call wins; later installs fail
+    // harmlessly, which is fine — we only need one installed)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut root_store = rustls::RootCertStore::empty();
+
+    // Add webpki roots (Mozilla root certificates)
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+    )
+});
 
 /// TLS information extracted from the handshake
 #[derive(Debug, Clone)]
@@ -29,8 +41,6 @@ pub struct TlsInfo {
     pub cert_san: Vec<String>,
     pub cert_expiry: chrono::DateTime<chrono::Utc>,
     pub cert_days_remaining: i64,
-    #[allow(dead_code)]
-    pub status: TlsStatus,
 }
 
 /// Perform a TLS handshake with precise timing
@@ -42,9 +52,8 @@ pub async fn tls_handshake(
 ) -> Result<(TlsStream<TokioTcpStream>, TlsInfo), ProbeError> {
     let start = Instant::now();
 
-    // Build TLS client config with webpki roots
-    let config = build_tls_config()?;
-    let connector = TlsConnector::from(Arc::new(config));
+    // Shared TLS client config with webpki roots (built once, lazily)
+    let connector = TlsConnector::from(Arc::clone(&CLIENT_CONFIG));
 
     // Parse server name
     let server_name = ServerName::try_from(hostname.to_string())
@@ -66,23 +75,6 @@ pub async fn tls_handshake(
     let info = extract_tls_info(&tls_stream, handshake_ms)?;
 
     Ok((tls_stream, info))
-}
-
-/// Build TLS client configuration
-fn build_tls_config() -> Result<ClientConfig, ProbeError> {
-    // Use ring as the crypto provider
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let mut root_store = rustls::RootCertStore::empty();
-
-    // Add webpki roots (Mozilla root certificates)
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-
-    Ok(config)
 }
 
 /// Extract TLS information from the established connection
@@ -146,7 +138,6 @@ fn extract_tls_info<S>(stream: &TlsStream<S>, handshake_ms: f64) -> Result<TlsIn
         cert_san,
         cert_expiry,
         cert_days_remaining,
-        status: TlsStatus::Ok,
     })
 }
 
@@ -189,12 +180,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_tls_status_enum() {
-        assert_eq!(TlsStatus::Ok, TlsStatus::Ok);
-        assert_ne!(TlsStatus::Ok, TlsStatus::Error);
-    }
-
-    #[test]
     fn test_tls_info_structure() {
         let info = TlsInfo {
             handshake_ms: 42.3,
@@ -205,7 +190,6 @@ mod tests {
             cert_san: vec!["example.com".to_string(), "www.example.com".to_string()],
             cert_expiry: chrono::Utc::now() + chrono::Duration::days(90),
             cert_days_remaining: 90,
-            status: TlsStatus::Ok,
         };
 
         assert_eq!(info.handshake_ms, 42.3);

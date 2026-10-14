@@ -23,9 +23,6 @@ pub struct Theme {
     pub critical: Color,
     /// Info severity (blue)
     pub info: Color,
-    /// Background (transparent/default)
-    #[allow(dead_code)]
-    pub background: Color,
     /// Focused panel border color (bright cyan)
     pub focused_border: Color,
 }
@@ -49,7 +46,6 @@ impl Theme {
             warning: Color::Rgb(255, 170, 0),
             critical: Color::Rgb(255, 0, 0),
             info: Color::Rgb(0, 170, 255),
-            background: Color::Reset,
             focused_border: Color::Rgb(0, 255, 255),
         }
     }
@@ -68,17 +64,6 @@ impl Theme {
             self.warning
         } else {
             self.critical
-        }
-    }
-
-    /// Get color for severity level
-    #[allow(dead_code)]
-    pub fn color_for_severity(&self, severity: &str) -> Color {
-        match severity.to_lowercase().as_str() {
-            "info" => self.info,
-            "warning" => self.warning,
-            "critical" => self.critical,
-            _ => self.text,
         }
     }
 
@@ -120,22 +105,6 @@ impl Theme {
     }
 }
 
-/// Global theme instance
-#[allow(dead_code)]
-pub static THEME: Theme = Theme {
-    border: Color::Rgb(100, 100, 100),
-    title: Color::Rgb(0, 170, 255),
-    text: Color::White,
-    dimmed: Color::DarkGray,
-    excellent: Color::Rgb(0, 255, 0),
-    good: Color::Rgb(170, 255, 0),
-    warning: Color::Rgb(255, 170, 0),
-    critical: Color::Rgb(255, 0, 0),
-    info: Color::Rgb(0, 170, 255),
-    background: Color::Reset,
-    focused_border: Color::Rgb(0, 255, 255),
-};
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,17 +138,6 @@ mod tests {
             theme.color_for_rtt(150.0, 20.0, 50.0, 100.0),
             theme.critical
         );
-    }
-
-    #[test]
-    fn test_color_for_severity() {
-        let theme = Theme::new();
-
-        assert_eq!(theme.color_for_severity("info"), theme.info);
-        assert_eq!(theme.color_for_severity("INFO"), theme.info);
-        assert_eq!(theme.color_for_severity("warning"), theme.warning);
-        assert_eq!(theme.color_for_severity("critical"), theme.critical);
-        assert_eq!(theme.color_for_severity("unknown"), theme.text);
     }
 
     #[test]

@@ -17,13 +17,16 @@ pub struct TracingLogEntry {
 
 /// Custom tracing layer that sends events to a channel
 pub struct TuiTracingLayer {
-    sender: mpsc::UnboundedSender<TracingLogEntry>,
+    sender: mpsc::Sender<TracingLogEntry>,
 }
 
 impl TuiTracingLayer {
+    /// Capacity of the bounded channel feeding the TUI log consumer
+    pub const CHANNEL_BUFFER_SIZE: usize = 1024;
+
     /// Create a new TUI tracing layer with a channel
-    pub fn new() -> (Self, mpsc::UnboundedReceiver<TracingLogEntry>) {
-        let (sender, receiver) = mpsc::unbounded_channel();
+    pub fn new() -> (Self, mpsc::Receiver<TracingLogEntry>) {
+        let (sender, receiver) = mpsc::channel(Self::CHANNEL_BUFFER_SIZE);
         (Self { sender }, receiver)
     }
 }
@@ -49,8 +52,10 @@ where
             message: visitor.message,
         };
 
-        // Send to channel (ignore errors if receiver is dropped)
-        let _ = self.sender.send(entry);
+        // Bounded channel: drop the entry if the TUI consumer cannot keep up
+        // instead of growing the queue without bound. The store's log deque
+        // is bounded — the channel must not be the unbounded link in between.
+        let _ = self.sender.try_send(entry);
     }
 }
 
@@ -63,11 +68,15 @@ struct MessageVisitor {
 impl tracing::field::Visit for MessageVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
         if field.name() == "message" {
-            self.message = format!("{:?}", value);
-            // Remove surrounding quotes if present
-            if self.message.starts_with('"') && self.message.ends_with('"') {
-                self.message = self.message[1..self.message.len() - 1].to_string();
-            }
+            let rendered = format!("{:?}", value);
+            // Strip the surrounding quotes `Debug` adds for strings. This
+            // must be lenient: a rendering of exactly one `"` satisfies both
+            // predicates and would panic on a `1..0` slice.
+            self.message = rendered
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .map(str::to_owned)
+                .unwrap_or(rendered);
         }
     }
 
@@ -79,4 +88,4 @@ impl tracing::field::Visit for MessageVisitor {
 }
 
 /// Receiver handle for consuming tracing log entries
-pub type TracingLogReceiver = mpsc::UnboundedReceiver<TracingLogEntry>;
+pub type TracingLogReceiver = mpsc::Receiver<TracingLogEntry>;

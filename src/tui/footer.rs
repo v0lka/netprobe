@@ -97,8 +97,13 @@ mod tests {
         let theme = Theme::new();
         let footer = FooterWidget::new(&theme);
 
-        // Just verify it doesn't panic
-        let _line = footer.format_footer();
+        // The formatted line must contain every advertised hotkey, in order
+        let line = footer.format_footer();
+        let text: String = line.spans.iter().map(|s| s.content.to_string()).collect();
+        assert_eq!(
+            text,
+            "q:quit  t:traceroute  n/p:switch IP  r:reset  ↑↓:scroll  Tab:focus  ?:help"
+        );
     }
 
     #[test]

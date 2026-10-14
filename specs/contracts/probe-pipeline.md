@@ -13,10 +13,11 @@ Probe loops depend on `store` (write), `models` (records), and `anomaly` (detect
 | `cancel: CancellationToken` | `tokio_util` | `app.rs` | all tasks | cooperative shutdown |
 | `ip_rx: watch::Receiver<IpAddr>` | watch channel | `app.rs` (TUI writes) | icmp, tcp, traceroute | active target IP |
 | `trace_notify: Arc<Notify>` | notify | `app.rs` (TUI notifies) | traceroute loop | forced trace signal |
+| `reset_notify: Arc<Notify>` | notify | `app.rs` (TUI notifies) | icmp loop | statistics-reset signal (re-create the anomaly detector) |
 
 ## Initialization
 
-`app::run` creates store, logger channel, token, watch channel (seeded with the resolved IP), and `Notify`; clones the handles per task; spawns each loop (`src/app.rs` step 8–9). The traceroute task is spawned only when the availability flag is set — the flag comes from `TracerouteProber::new` privilege discovery (see [../domains/probing/traceroute.md](../domains/probing/traceroute.md) and [ADR-0006](../decisions/0006-traceroute-startup-privilege-gating.md)). Loop cadences come from `Config`; probers are constructed before spawning (ICMP strategy detection happens there and is fatal on failure).
+`app::run` creates store, logger channel, token, watch channel (seeded with the resolved IP), and the two `Notify` signals (`trace_notify`, `reset_notify`); clones the handles per task; spawns each loop (`src/app.rs` step 8–9). The traceroute task is spawned only when the availability flag is set — the flag comes from `TracerouteProber::new` privilege discovery (see [../domains/probing/traceroute.md](../domains/probing/traceroute.md) and [ADR-0006](../decisions/0006-traceroute-startup-privilege-gating.md)). Loop cadences come from `Config`; probers are constructed before spawning (ICMP strategy detection happens there; construction is infallible — an unavailable ICMP transport falls back to the `subprocess` strategy).
 
 ## Data Flow Across Boundary
 
@@ -28,7 +29,7 @@ Per probe attempt, a loop must (in this order):
 
 ## Error Propagation
 
-- Probe-internal failures are **values, not errors**: statuses (`timeout`, `refused`, `nxdomain`, …), `ProbeResult.error` strings, and anomaly events. A loop function returns `Result` only for unexpected internal failures (it currently always returns `Ok` on cancellation).
+- Probe-internal failures are **values, not errors**: statuses (`timeout`, `refused`, `nxdomain`, …), `ProbeResult.error` strings, and anomaly events. The ICMP/DNS/TCP loop functions return `Result` only for unexpected internal failures (they currently always return `Ok` on cancellation); the traceroute loop returns `()` — every trace outcome, including failures, is recorded as a value.
 - Any `panic` in a loop task is contained: `app.rs` joins with a 5 s timeout, logs, and continues shutdown — but the layer stops updating until restart.
 
 ## Breaking Change Checklist

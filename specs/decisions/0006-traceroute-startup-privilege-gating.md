@@ -33,7 +33,7 @@ Positive:
 Negative:
 
 - Privileges granted after startup (e.g. `setcap` applied or a sudo re-launch consideration) do not spawn the traceroute task until restart; per-trace checking tolerates privileges being dropped, not gained.
-- Privilege discovery runs twice at startup (flag check at construction, safety-net check per trace).
+- Privilege discovery runs at two startup sites (the availability probe `TracerouteProber::new(...).is_ok()` and the spawn-time construction) plus once per trace as the safety-net check inside `trace_unix`.
 
 ## Alternatives Considered
 

@@ -32,36 +32,35 @@ pub mod rtt_thresholds {
 ///   2 5
 ///   3 6
 ///   7 8
+///
+/// Each array is ordered bottom→top: index 0 is the cell's bottom dot, so a
+/// larger level fills dots closer to the top (bottom-up fill, as documented
+/// in `specs/domains/tui/sparkline.md`).
 const BRAILLE_PATTERNS: [[u8; 4]; 2] = [
-    [0x01, 0x02, 0x04, 0x40], // Left column: dots 1, 2, 3, 7
-    [0x08, 0x10, 0x20, 0x80], // Right column: dots 4, 5, 6, 8
+    [0x40, 0x04, 0x02, 0x01], // Left column: dots 7, 3, 2, 1 (bottom→top)
+    [0x80, 0x20, 0x10, 0x08], // Right column: dots 8, 6, 5, 4 (bottom→top)
 ];
 
 /// Base Unicode codepoint for braille patterns
 const BRAILLE_BASE: u32 = 0x2800;
 
 /// Custom braille sparkline widget
+#[derive(Clone)]
 pub struct BrailleSparkline<'a> {
     /// Data to display
     data: &'a [f64],
-    /// Minimum value for scaling
-    min: f64,
-    /// Maximum value for scaling
-    max: f64,
     /// Height in terminal rows (default: 2)
     height: u16,
     /// Style for the sparkline
     style: Style,
     /// Optional color function that takes the raw data value and returns a color
-    color_fn: Option<Box<dyn Fn(f64) -> Color + 'a>>,
+    color_fn: Option<std::sync::Arc<dyn Fn(f64) -> Color + 'a>>,
 }
 
 impl<'a> std::fmt::Debug for BrailleSparkline<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BrailleSparkline")
             .field("data_len", &self.data.len())
-            .field("min", &self.min)
-            .field("max", &self.max)
             .field("height", &self.height)
             .field("style", &self.style)
             .field("has_color_fn", &self.color_fn.is_some())
@@ -69,27 +68,11 @@ impl<'a> std::fmt::Debug for BrailleSparkline<'a> {
     }
 }
 
-impl<'a> Clone for BrailleSparkline<'a> {
-    fn clone(&self) -> Self {
-        Self {
-            data: self.data,
-            min: self.min,
-            max: self.max,
-            height: self.height,
-            style: self.style,
-            color_fn: None, // Cannot clone the closure, so we lose the color function on clone
-        }
-    }
-}
-
 impl<'a> BrailleSparkline<'a> {
     /// Create a new braille sparkline
     pub fn new(data: &'a [f64]) -> Self {
-        let (min, max) = Self::calculate_bounds(data);
         Self {
             data,
-            min,
-            max,
             height: 2,
             style: Style::default(),
             color_fn: None,
@@ -102,27 +85,12 @@ impl<'a> BrailleSparkline<'a> {
         self
     }
 
-    /// Set the style
-    #[allow(dead_code)]
-    pub fn style(mut self, style: Style) -> Self {
-        self.style = style;
-        self
-    }
-
     /// Set a custom color function that receives raw data values
     pub fn color_fn<F>(mut self, f: F) -> Self
     where
         F: Fn(f64) -> Color + 'a,
     {
-        self.color_fn = Some(Box::new(f));
-        self
-    }
-
-    /// Set explicit min/max bounds
-    #[allow(dead_code)]
-    pub fn bounds(mut self, min: f64, max: f64) -> Self {
-        self.min = min;
-        self.max = max;
+        self.color_fn = Some(std::sync::Arc::new(f));
         self
     }
 
@@ -149,16 +117,16 @@ impl<'a> BrailleSparkline<'a> {
     }
 
     /// Normalize a value to 0.0-1.0 range
-    fn normalize(&self, value: f64) -> f64 {
-        if self.max == self.min {
+    fn normalize(min: f64, max: f64, value: f64) -> f64 {
+        if max == min {
             return 0.5;
         }
-        ((value - self.min) / (self.max - self.min)).clamp(0.0, 1.0)
+        ((value - min) / (max - min)).clamp(0.0, 1.0)
     }
 
     /// Get color for a data value
     fn get_color(&self, value: f64) -> Color {
-        if let Some(ref color_fn) = self.color_fn {
+        if let Some(color_fn) = &self.color_fn {
             color_fn(value)
         } else {
             self.style.fg.unwrap_or(Color::White)
@@ -176,9 +144,10 @@ impl<'a> BrailleSparkline<'a> {
         let left_level = (left_val * total_levels as f64).min(total_levels as f64 - 1.0) as u16;
         let right_level = (right_val * total_levels as f64).min(total_levels as f64 - 1.0) as u16;
 
-        // Determine which dots to set for this row
-        let row_start = row * levels_per_row;
-        let _row_end = row_start + levels_per_row;
+        // Rows are emitted top→bottom on screen; each cell's level band is
+        // indexed from the bottom so higher values fill dots closer to the
+        // top (bottom-up fill).
+        let row_start = (height - 1 - row) * levels_per_row;
 
         let mut pattern: u8 = 0;
 
@@ -214,15 +183,23 @@ impl<'a> Widget for BrailleSparkline<'a> {
         // Each character displays 2 data points, so we need 2*width data points
         let data_points_needed = width * 2;
 
-        // Sample or interpolate data to fit the width
-        let sampled_data: Vec<f64> = if self.data.len() >= data_points_needed {
-            // Take the last data_points_needed values
-            self.data[self.data.len() - data_points_needed..].to_vec()
+        // Only the rendered tail contributes to auto-bounds: a single old
+        // extreme must not pin the scale of the visible window.
+        let tail: &[f64] = if self.data.len() >= data_points_needed {
+            &self.data[self.data.len() - data_points_needed..]
         } else {
-            // Pad with zeros at the beginning if we don't have enough data
-            let padding = data_points_needed - self.data.len();
-            let mut padded = vec![self.min; padding];
-            padded.extend_from_slice(self.data);
+            self.data
+        };
+        let (min, max) = Self::calculate_bounds(tail);
+
+        // Sample or interpolate data to fit the width
+        let sampled_data: Vec<f64> = if tail.len() >= data_points_needed {
+            tail.to_vec()
+        } else {
+            // Pad with `min` at the beginning so the chart grows from the right
+            let padding = data_points_needed - tail.len();
+            let mut padded = vec![min; padding];
+            padded.extend_from_slice(tail);
             padded
         };
 
@@ -247,8 +224,8 @@ impl<'a> Widget for BrailleSparkline<'a> {
 
                 let raw_left = sampled_data[data_idx];
                 let raw_right = sampled_data[data_idx + 1];
-                let left_val = self.normalize(raw_left);
-                let right_val = self.normalize(raw_right);
+                let left_val = Self::normalize(min, max, raw_left);
+                let right_val = Self::normalize(min, max, raw_right);
 
                 // Calculate braille character
                 let ch = Self::calculate_braille_for_row(left_val, right_val, row, height);
@@ -262,15 +239,6 @@ impl<'a> Widget for BrailleSparkline<'a> {
             }
         }
     }
-}
-
-/// Helper function to create a gradient color from green to red
-#[allow(dead_code)]
-pub fn gradient_green_to_red(normalized: f64) -> Color {
-    // normalized: 0.0 = green (excellent), 1.0 = red (critical)
-    let r = (normalized * 255.0) as u8;
-    let g = ((1.0 - normalized) * 255.0) as u8;
-    Color::Rgb(r, g, 0)
 }
 
 /// Helper function to create a color based on absolute RTT thresholds (in ms)
@@ -296,37 +264,94 @@ mod tests {
         let data = vec![10.0, 20.0, 30.0, 40.0, 50.0];
         let sparkline = BrailleSparkline::new(&data);
 
-        assert_eq!(sparkline.min, 10.0);
-        assert_eq!(sparkline.max, 50.0);
         assert_eq!(sparkline.height, 2);
+        assert_eq!(sparkline.data, &data[..]);
     }
 
     #[test]
-    fn test_braille_sparkline_empty() {
-        let data: Vec<f64> = vec![];
-        let sparkline = BrailleSparkline::new(&data);
+    fn test_calculate_bounds() {
+        let data = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        assert_eq!(BrailleSparkline::calculate_bounds(&data), (10.0, 50.0));
 
-        assert_eq!(sparkline.min, 0.0);
-        assert_eq!(sparkline.max, 1.0);
-    }
+        // Empty data gets a default range
+        assert_eq!(BrailleSparkline::calculate_bounds(&[]), (0.0, 1.0));
 
-    #[test]
-    fn test_braille_sparkline_single_value() {
-        let data = vec![42.0];
-        let sparkline = BrailleSparkline::new(&data);
-
-        assert_eq!(sparkline.min, 42.0);
-        assert_eq!(sparkline.max, 43.0); // Single value gets +1 range
+        // Single value gets +1 range
+        assert_eq!(BrailleSparkline::calculate_bounds(&[42.0]), (42.0, 43.0));
     }
 
     #[test]
     fn test_normalize() {
-        let data = vec![0.0, 50.0, 100.0];
-        let sparkline = BrailleSparkline::new(&data);
+        assert_eq!(BrailleSparkline::normalize(0.0, 100.0, 0.0), 0.0);
+        assert_eq!(BrailleSparkline::normalize(0.0, 100.0, 50.0), 0.5);
+        assert_eq!(BrailleSparkline::normalize(0.0, 100.0, 100.0), 1.0);
+        // Degenerate range maps to mid-scale
+        assert_eq!(BrailleSparkline::normalize(5.0, 5.0, 5.0), 0.5);
+    }
 
-        assert_eq!(sparkline.normalize(0.0), 0.0);
-        assert_eq!(sparkline.normalize(50.0), 0.5);
-        assert_eq!(sparkline.normalize(100.0), 1.0);
+    #[test]
+    fn test_braille_orientation_bottom_up() {
+        // A single-row chart (4 levels): the minimum must light only the
+        // bottom dots (0x40 left, 0x80 right), never the top ones.
+        let ch_min = BrailleSparkline::calculate_braille_for_row(0.0, 0.0, 0, 1);
+        assert_eq!(ch_min as u32, 0x2800 + 0x40 + 0x80);
+
+        // The maximum must fill the whole cell (all dots set).
+        let ch_max = BrailleSparkline::calculate_braille_for_row(1.0, 1.0, 0, 1);
+        assert_eq!(
+            ch_max as u32,
+            0x2800 + 0x40 + 0x04 + 0x02 + 0x01 + 0x80 + 0x20 + 0x10 + 0x08
+        );
+
+        // With two rows, the bottom row fills first: a mid value (level 2 of
+        // 8) paints the three lowest dots of the bottom row and nothing in
+        // the top row.
+        let ch_mid_bottom = BrailleSparkline::calculate_braille_for_row(0.25, 0.25, 1, 2);
+        assert_eq!(
+            ch_mid_bottom as u32,
+            0x2800 + 0x40 + 0x04 + 0x02 + 0x80 + 0x20 + 0x10
+        );
+        let ch_mid_top = BrailleSparkline::calculate_braille_for_row(0.25, 0.25, 0, 2);
+        assert_eq!(ch_mid_top as u32, 0x2800);
+    }
+
+    #[test]
+    fn test_render_bounds_follow_visible_tail() {
+        // A large spike far in the past must not pin the scale of the
+        // rendered tail (width 1 cell = 2 data points → tail is [21, 22]).
+        let data = vec![500.0, 20.0, 21.0, 22.0];
+        let sparkline = BrailleSparkline::new(&data).height(1);
+
+        let backend = ratatui::backend::TestBackend::new(1, 1);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                use ratatui::widgets::Widget;
+                sparkline.clone().render(f.area(), f.buffer_mut());
+            })
+            .unwrap();
+
+        // The tail values (21 vs 22) span the full scale: the left column is
+        // at its minimum (bottom dot only) while the right column is at its
+        // maximum (all 4 dots). With whole-history bounds the tail would
+        // collapse to the bottom dot on both columns.
+        let cell = terminal.backend().buffer()[(0, 0)].symbol();
+        let ch = cell.chars().next().unwrap();
+        assert_eq!(ch as u32, 0x2800 + 0x40 + 0x80 + 0x20 + 0x10 + 0x08);
+    }
+
+    #[test]
+    fn test_braille_clone_preserves_color_fn() {
+        let data = vec![1.0, 2.0, 3.0];
+        let sparkline = BrailleSparkline::new(&data).color_fn(gradient_for_rtt);
+        let cloned = sparkline.clone();
+
+        assert!(cloned.color_fn.is_some());
+        // The cloned color function still maps values through the gradient
+        assert_eq!(
+            (cloned.color_fn.as_ref().unwrap())(0.0),
+            gradient_for_rtt(0.0)
+        );
     }
 
     #[test]
@@ -338,18 +363,6 @@ mod tests {
         // Full height should give full pattern
         let ch_full = BrailleSparkline::calculate_braille_for_row(1.0, 1.0, 0, 2);
         assert!(ch_full as u32 > 0x2800);
-    }
-
-    #[test]
-    fn test_gradient_green_to_red() {
-        let green = gradient_green_to_red(0.0);
-        assert!(matches!(green, Color::Rgb(0, 255, 0)));
-
-        let red = gradient_green_to_red(1.0);
-        assert!(matches!(red, Color::Rgb(255, 0, 0)));
-
-        let mid = gradient_green_to_red(0.5);
-        assert!(matches!(mid, Color::Rgb(127, 127, 0)));
     }
 
     #[test]

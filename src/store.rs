@@ -1,6 +1,7 @@
 //! Metrics store for shared state
 
 use crate::models::*;
+use crate::util::{calculate_percentile, compute_jitter};
 use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -23,75 +24,41 @@ impl<T> RingBuffer<T> {
     }
 
     /// Push a value into the buffer, removing oldest if at capacity
+    ///
+    /// `make_contiguous` re-rotates the backing storage, so once the buffer
+    /// has wrapped at capacity `as_slice` still observes the complete
+    /// chronological window instead of only the front run.
     pub fn push(&mut self, value: T) {
         if self.buffer.len() >= self.capacity {
             self.buffer.pop_front();
         }
         self.buffer.push_back(value);
+        self.buffer.make_contiguous();
     }
 
-    /// Get the current number of elements
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    /// Check if buffer is empty
-    #[allow(dead_code)]
-    pub fn is_empty(&self) -> bool {
-        self.buffer.is_empty()
-    }
-
-    /// Get all values as a slice (for reading)
-    /// Note: This returns a slice based on the current contiguous layout.
-    /// For non-contiguous deques, we return an empty slice to avoid mutability issues.
+    /// Get all values as a slice in chronological order (oldest first)
+    ///
+    /// Every mutating method keeps the backing deque contiguous (`push`
+    /// calls `make_contiguous`, `clear` empties it), so the single front
+    /// slice is always the complete window — including after the buffer
+    /// has wrapped at capacity.
     pub fn as_slice(&self) -> &[T] {
-        // VecDeque::as_slices returns two slices; we use the first if contiguous
-        let (first, second) = self.buffer.as_slices();
-        if second.is_empty() {
-            first
-        } else {
-            // Non-contiguous case - return empty to avoid complexity
-            // In practice, with our usage pattern, this rarely happens
-            first
-        }
-    }
-
-    /// Get the newest value
-    #[allow(dead_code)]
-    pub fn latest(&self) -> Option<&T> {
-        self.buffer.back()
+        self.buffer.as_slices().0
     }
 
     /// Clear the buffer
     pub fn clear(&mut self) {
         self.buffer.clear();
     }
-
-    /// Get capacity
-    #[allow(dead_code)]
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-}
-
-impl<T: Clone> RingBuffer<T> {
-    /// Get all values as a Vec
-    #[allow(dead_code)]
-    pub fn to_vec(&self) -> Vec<T> {
-        self.buffer.iter().cloned().collect()
-    }
 }
 
 /// Aggregated ICMP statistics
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct IcmpAggregates {
     pub min_rtt: f64,
     pub max_rtt: f64,
     pub avg_rtt: f64,
-    pub p50_rtt: f64,
     pub p95_rtt: f64,
-    pub p99_rtt: f64,
     pub jitter: f64,
     pub sent: u64,
     pub received: u64,
@@ -105,8 +72,6 @@ pub struct IcmpAggregates {
 pub struct ProbeResult<T> {
     pub data: Option<T>,
     pub error: Option<String>,
-    #[allow(dead_code)]
-    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl<T> Default for ProbeResult<T> {
@@ -114,7 +79,6 @@ impl<T> Default for ProbeResult<T> {
         Self {
             data: None,
             error: None,
-            timestamp: chrono::Utc::now(),
         }
     }
 }
@@ -140,14 +104,6 @@ pub struct TlsData {
     pub handshake_ms: f64,
     pub version: String,
     pub cipher: String,
-    #[allow(dead_code)]
-    pub cert_subject: String,
-    #[allow(dead_code)]
-    pub cert_issuer: String,
-    #[allow(dead_code)]
-    pub cert_san: Vec<String>,
-    #[allow(dead_code)]
-    pub cert_expiry: chrono::DateTime<chrono::Utc>,
     pub cert_days_remaining: i64,
 }
 
@@ -172,8 +128,6 @@ pub struct HopData {
 #[derive(Debug, Clone)]
 pub struct TracerouteData {
     pub hops: Vec<HopData>,
-    #[allow(dead_code)]
-    pub hop_count: u8,
 }
 
 /// Event entry for the events deque
@@ -208,6 +162,8 @@ pub struct MetricsStore {
     // Events log (bounded deque) - network anomalies only
     events: VecDeque<EventEntry>,
     max_events: usize,
+    /// Total number of events ever pushed (unbounded; the deque is capped)
+    events_total: u64,
 
     // Logs (bounded deque) - tracing/log messages
     logs: VecDeque<EventEntry>,
@@ -220,7 +176,6 @@ pub struct MetricsStore {
     // Target info
     target: String,
     resolved_target: Option<String>,
-    resolved_ip: Option<String>,
     /// All resolved IP addresses
     resolved_ips: Vec<IpAddr>,
     /// Index of currently active IP for monitoring
@@ -247,13 +202,13 @@ impl MetricsStore {
             latest_traceroute: ProbeResult::default(),
             events: VecDeque::with_capacity(Self::DEFAULT_MAX_EVENTS),
             max_events: Self::DEFAULT_MAX_EVENTS,
+            events_total: 0,
             logs: VecDeque::with_capacity(Self::DEFAULT_MAX_EVENTS),
             max_logs: Self::DEFAULT_MAX_EVENTS,
             session_start: chrono::Utc::now(),
             traceroute_available: true,
             target,
             resolved_target: None,
-            resolved_ip: None,
             resolved_ips: Vec::new(),
             active_ip_index: 0,
         }
@@ -308,11 +263,7 @@ impl MetricsStore {
 
     /// Set latest DNS result
     pub fn set_latest_dns(&mut self, data: Option<DnsData>, error: Option<String>) {
-        self.latest_dns = ProbeResult {
-            data,
-            error,
-            timestamp: chrono::Utc::now(),
-        };
+        self.latest_dns = ProbeResult { data, error };
     }
 
     /// Get latest DNS result
@@ -334,11 +285,7 @@ impl MetricsStore {
 
     /// Set latest TCP result
     pub fn set_latest_tcp(&mut self, data: Option<TcpData>, error: Option<String>) {
-        self.latest_tcp = ProbeResult {
-            data,
-            error,
-            timestamp: chrono::Utc::now(),
-        };
+        self.latest_tcp = ProbeResult { data, error };
     }
 
     /// Get latest TCP result
@@ -361,11 +308,7 @@ impl MetricsStore {
 
     /// Set latest TLS result
     pub fn set_latest_tls(&mut self, data: Option<TlsData>, error: Option<String>) {
-        self.latest_tls = ProbeResult {
-            data,
-            error,
-            timestamp: chrono::Utc::now(),
-        };
+        self.latest_tls = ProbeResult { data, error };
     }
 
     /// Get latest TLS result
@@ -388,11 +331,7 @@ impl MetricsStore {
 
     /// Set latest HTTP result
     pub fn set_latest_http(&mut self, data: Option<HttpData>, error: Option<String>) {
-        self.latest_http = ProbeResult {
-            data,
-            error,
-            timestamp: chrono::Utc::now(),
-        };
+        self.latest_http = ProbeResult { data, error };
     }
 
     /// Get latest HTTP result
@@ -404,11 +343,7 @@ impl MetricsStore {
 
     /// Set latest traceroute result
     pub fn set_latest_traceroute(&mut self, data: Option<TracerouteData>, error: Option<String>) {
-        self.latest_traceroute = ProbeResult {
-            data,
-            error,
-            timestamp: chrono::Utc::now(),
-        };
+        self.latest_traceroute = ProbeResult { data, error };
     }
 
     /// Get latest traceroute result
@@ -420,6 +355,7 @@ impl MetricsStore {
 
     /// Push a new event
     pub fn push_event(&mut self, event_type: String, severity: Severity, message: String) {
+        self.events_total += 1;
         if self.events.len() >= self.max_events {
             self.events.pop_front();
         }
@@ -442,11 +378,13 @@ impl MetricsStore {
             tracing::Level::TRACE => ("log_trace", Severity::Info),
         };
 
-        // Sanitize message: remove newlines and control characters that break TUI layout
-        let sanitized_message = message
-            .replace('\n', " ")
-            .replace('\r', "")
-            .replace('\t', " ");
+        // Sanitize message: replace ALL control characters (C0 range and
+        // DEL — including ESC/ANSI escape sequences) with spaces so they
+        // cannot break the TUI layout
+        let sanitized_message: String = message
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
 
         // Format message with shortened target
         let short_target = target.split("::").last().unwrap_or(target);
@@ -466,6 +404,14 @@ impl MetricsStore {
     /// Get events (network anomalies)
     pub fn events(&self) -> &VecDeque<EventEntry> {
         &self.events
+    }
+
+    /// Get the total number of events ever pushed
+    ///
+    /// Unlike [`Self::events`] (a bounded deque that evicts FIFO), this
+    /// counter never decreases, so it reflects the true session event count.
+    pub fn events_total(&self) -> u64 {
+        self.events_total
     }
 
     /// Get logs (tracing messages)
@@ -500,33 +446,18 @@ impl MetricsStore {
         self.resolved_target = resolved;
     }
 
-    /// Get resolved target (hostname)
-    #[allow(dead_code)]
-    pub fn resolved_target(&self) -> Option<&str> {
-        self.resolved_target.as_deref()
-    }
-
-    /// Set resolved IP address
-    pub fn set_resolved_ip(&mut self, ip: Option<String>) {
-        self.resolved_ip = ip;
-    }
-
-    /// Get resolved IP address
-    #[allow(dead_code)]
-    pub fn resolved_ip(&self) -> Option<&str> {
-        self.resolved_ip.as_deref()
-    }
-
-    /// Set all resolved IP addresses
-    pub fn set_resolved_ips(&mut self, ips: Vec<IpAddr>) {
+    /// Set all resolved IP addresses, marking `active` as the one currently
+    /// monitored by the probes
+    ///
+    /// `active` is matched by value against `ips`; when it is `None` or not
+    /// present in `ips`, index 0 is selected. Keeping the active index in
+    /// sync with the probed IP prevents the header from displaying a
+    /// different address than the one being measured.
+    pub fn set_resolved_ips_with_active(&mut self, ips: Vec<IpAddr>, active: Option<IpAddr>) {
+        self.active_ip_index = active
+            .and_then(|ip| ips.iter().position(|&candidate| candidate == ip))
+            .unwrap_or(0);
         self.resolved_ips = ips;
-        self.active_ip_index = 0;
-    }
-
-    /// Get all resolved IP addresses
-    #[allow(dead_code)]
-    pub fn resolved_ips(&self) -> &[IpAddr] {
-        &self.resolved_ips
     }
 
     /// Get the currently active IP for monitoring
@@ -546,16 +477,24 @@ impl MetricsStore {
 
     /// Switch to the next IP address
     /// Returns true if switched, false if there's only one or no IPs
+    ///
+    /// Per-endpoint ICMP statistics (history + aggregates) are cleared on a
+    /// successful switch so the panel, header MOS, and session summary reflect
+    /// only the newly selected endpoint.
     pub fn next_ip(&mut self) -> bool {
         if self.resolved_ips.len() <= 1 {
             return false;
         }
         self.active_ip_index = (self.active_ip_index + 1) % self.resolved_ips.len();
+        self.clear_icmp_stats();
         true
     }
 
     /// Switch to the previous IP address
     /// Returns true if switched, false if there's only one or no IPs
+    ///
+    /// Like [`Self::next_ip`], a successful switch clears the per-endpoint
+    /// ICMP statistics.
     pub fn prev_ip(&mut self) -> bool {
         if self.resolved_ips.len() <= 1 {
             return false;
@@ -565,19 +504,26 @@ impl MetricsStore {
         } else {
             self.active_ip_index -= 1;
         }
+        self.clear_icmp_stats();
         true
+    }
+
+    /// Clear per-endpoint ICMP statistics (RTT history + aggregates)
+    fn clear_icmp_stats(&mut self) {
+        self.icmp_rtt_history.clear();
+        self.icmp_aggregates = IcmpAggregates::default();
     }
 
     /// Reset statistics (for 'r' hotkey)
     pub fn reset(&mut self) {
-        self.icmp_rtt_history.clear();
+        self.clear_icmp_stats();
         self.dns_resolve_history.clear();
         self.tcp_connect_history.clear();
         self.tls_handshake_history.clear();
         self.ttfb_history.clear();
-        self.icmp_aggregates = IcmpAggregates::default();
         self.session_start = chrono::Utc::now();
-        // Note: we don't clear events or latest results on reset
+        // Note: we don't clear events, the events_total counter, or latest
+        // results on reset
     }
 
     // Private helper methods
@@ -605,31 +551,18 @@ impl MetricsStore {
 
         let avg = sum / values.len() as f64;
 
-        // Calculate percentiles (need sorted copy)
-        let mut sorted: Vec<f64> = values.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let p50 = percentile(&sorted, 0.50);
-        let p95 = percentile(&sorted, 0.95);
-        let p99 = percentile(&sorted, 0.99);
+        // Lower-index quantile (rank ⌊p·(n−1)⌋, see `util::calculate_percentile`)
+        // via partial selection: O(n) average per sample instead of an
+        // O(n log n) full sort (and NaN-safe)
+        let p95 = calculate_percentile(values, 0.95);
 
         // Calculate jitter (mean absolute difference between consecutive values)
-        let jitter = if values.len() >= 2 {
-            let mut jitter_sum = 0.0;
-            for i in 1..values.len() {
-                jitter_sum += (values[i] - values[i - 1]).abs();
-            }
-            jitter_sum / (values.len() - 1) as f64
-        } else {
-            0.0
-        };
+        let jitter = compute_jitter(values);
 
         self.icmp_aggregates.min_rtt = min;
         self.icmp_aggregates.max_rtt = max;
         self.icmp_aggregates.avg_rtt = avg;
-        self.icmp_aggregates.p50_rtt = p50;
         self.icmp_aggregates.p95_rtt = p95;
-        self.icmp_aggregates.p99_rtt = p99;
         self.icmp_aggregates.jitter = jitter;
 
         self.recalculate_loss_pct();
@@ -637,20 +570,19 @@ impl MetricsStore {
 
     fn recalculate_loss_pct(&mut self) {
         if self.icmp_aggregates.sent > 0 {
-            let lost = self.icmp_aggregates.sent - self.icmp_aggregates.received;
+            // saturating_sub: `received` can exceed `sent` — transiently
+            // while a store reset races an in-flight probe result, and for
+            // as long as duplicate replies keep arriving (each duplicate
+            // pushes an RTT sample); a plain u64 subtraction would panic
+            // (debug) or wrap (release).
+            let lost = self
+                .icmp_aggregates
+                .sent
+                .saturating_sub(self.icmp_aggregates.received);
             self.icmp_aggregates.loss_pct =
                 (lost as f64 / self.icmp_aggregates.sent as f64) * 100.0;
         }
     }
-}
-
-/// Calculate percentile from sorted slice
-fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() {
-        return 0.0;
-    }
-    let index = (p * (sorted.len() - 1) as f64) as usize;
-    sorted[index]
 }
 
 /// Type alias for the shared store
@@ -663,34 +595,48 @@ mod tests {
     #[test]
     fn test_ring_buffer_basic() {
         let mut buf = RingBuffer::new(3);
-        assert!(buf.is_empty());
-        assert_eq!(buf.len(), 0);
+        assert!(buf.as_slice().is_empty());
 
         buf.push(1.0);
         buf.push(2.0);
-        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.as_slice().len(), 2);
 
         buf.push(3.0);
-        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.as_slice().len(), 3);
 
         // Should overflow - oldest removed
         buf.push(4.0);
-        assert_eq!(buf.len(), 3);
+        assert_eq!(buf.as_slice().len(), 3);
+        assert_eq!(buf.as_slice(), [2.0, 3.0, 4.0]);
+    }
 
-        let values = buf.to_vec();
-        assert_eq!(values, vec![2.0, 3.0, 4.0]);
+    #[test]
+    fn test_ring_buffer_as_slice_after_wrap() {
+        // Regression: once the deque wraps at capacity, as_slice must still
+        // return the complete window in chronological order — the wrapped
+        // tail holds the newest samples.
+        let mut buf = RingBuffer::new(3);
+        for v in 1..=7 {
+            buf.push(f64::from(v));
+        }
+        assert_eq!(buf.as_slice(), [5.0, 6.0, 7.0]);
+        assert_eq!(buf.as_slice().len(), 3);
+
+        // The wrapped state is stable: further pushes keep the window whole
+        buf.push(8.0);
+        assert_eq!(buf.as_slice(), [6.0, 7.0, 8.0]);
     }
 
     #[test]
     fn test_ring_buffer_latest() {
         let mut buf = RingBuffer::new(5);
-        assert_eq!(buf.latest(), None);
+        assert_eq!(buf.as_slice().last(), None);
 
         buf.push(10.0);
-        assert_eq!(buf.latest(), Some(&10.0));
+        assert_eq!(buf.as_slice().last(), Some(&10.0));
 
         buf.push(20.0);
-        assert_eq!(buf.latest(), Some(&20.0));
+        assert_eq!(buf.as_slice().last(), Some(&20.0));
     }
 
     #[test]
@@ -698,10 +644,10 @@ mod tests {
         let mut buf = RingBuffer::new(5);
         buf.push(1.0);
         buf.push(2.0);
-        assert_eq!(buf.len(), 2);
+        assert_eq!(buf.as_slice().len(), 2);
 
         buf.clear();
-        assert!(buf.is_empty());
+        assert!(buf.as_slice().is_empty());
     }
 
     #[test]
@@ -738,6 +684,22 @@ mod tests {
         assert_eq!(agg.sent, 10);
         assert_eq!(agg.received, 7);
         assert_eq!(agg.loss_pct, 30.0);
+    }
+
+    #[test]
+    fn test_metrics_store_loss_pct_received_exceeds_sent() {
+        let mut store = MetricsStore::new(100, "1.1.1.1".to_string());
+
+        // Transient inconsistent state (reset racing an in-flight result):
+        // `received` > `sent` must not panic or wrap loss_pct
+        store.inc_icmp_sent();
+        store.push_icmp_rtt(10.0);
+        store.push_icmp_rtt(12.0);
+
+        let agg = store.icmp_aggregates();
+        assert_eq!(agg.sent, 1);
+        assert_eq!(agg.received, 2);
+        assert_eq!(agg.loss_pct, 0.0);
     }
 
     #[test]
@@ -824,6 +786,8 @@ mod tests {
 
         // Should be capped at 200
         assert_eq!(store.events().len(), 200);
+        // But the total count is unbounded
+        assert_eq!(store.events_total(), 250);
     }
 
     #[test]
@@ -831,10 +795,29 @@ mod tests {
         let mut store = MetricsStore::new(100, "1.1.1.1".to_string());
         let original_start = store.session_start();
 
-        // Add some data
+        // Add data to every history, the aggregates, the event log, and a
+        // latest_* slot, so both halves of reset()'s contract are exercised:
+        // histories/aggregates are cleared, events and latest_* survive.
         store.push_icmp_rtt(10.0);
         store.push_dns_resolve(5.0);
+        store.push_tcp_connect(12.0);
+        store.push_tls_handshake(20.0);
+        store.push_ttfb(30.0);
         store.inc_icmp_sent();
+        store.push_event(
+            "rtt_spike".to_string(),
+            Severity::Warning,
+            "RTT spike detected".to_string(),
+        );
+        store.set_latest_dns(
+            Some(DnsData {
+                resolve_ms: 5.0,
+                ips: vec!["1.1.1.1".parse().unwrap()],
+                ttl_secs: Some(300),
+                server: "8.8.8.8".to_string(),
+            }),
+            None,
+        );
 
         // Small delay so the reset timestamp is strictly newer than the
         // original one (Utc::now() can return the same value within one tick)
@@ -843,9 +826,17 @@ mod tests {
         // Reset
         store.reset();
 
-        // Should be cleared
+        // All five histories and the aggregates should be cleared
         assert!(store.icmp_rtt_history().is_empty());
-        assert_eq!(store.icmp_aggregates().sent, 0);
+        assert!(store.dns_resolve_history().is_empty());
+        assert!(store.tcp_connect_history().is_empty());
+        assert!(store.tls_handshake_history().is_empty());
+        assert!(store.ttfb_history().is_empty());
+        assert_eq!(store.icmp_aggregates(), &IcmpAggregates::default());
+
+        // Events and latest_* slots are deliberately preserved
+        assert_eq!(store.events().len(), 1);
+        assert!(store.latest_dns().data.is_some());
 
         // Session start should be updated
         assert!(store.session_start() > original_start);
@@ -855,10 +846,10 @@ mod tests {
     fn test_percentile() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
-        assert_eq!(percentile(&data, 0.0), 1.0);
-        assert_eq!(percentile(&data, 0.5), 5.0);
-        assert_eq!(percentile(&data, 0.95), 9.0);
-        assert_eq!(percentile(&data, 1.0), 10.0);
+        assert_eq!(calculate_percentile(&data, 0.0), 1.0);
+        assert_eq!(calculate_percentile(&data, 0.5), 5.0);
+        assert_eq!(calculate_percentile(&data, 0.95), 9.0);
+        assert_eq!(calculate_percentile(&data, 1.0), 10.0);
     }
 
     #[test]
@@ -890,26 +881,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolved_target() {
-        let mut store = MetricsStore::new(100, "example.com".to_string());
-
-        assert_eq!(store.resolved_target(), None);
-
-        store.set_resolved_target(Some("one.one.one.one".to_string()));
-        assert_eq!(store.resolved_target(), Some("one.one.one.one"));
-    }
-
-    #[test]
-    fn test_resolved_ip() {
-        let mut store = MetricsStore::new(100, "example.com".to_string());
-
-        assert_eq!(store.resolved_ip(), None);
-
-        store.set_resolved_ip(Some("1.1.1.1".to_string()));
-        assert_eq!(store.resolved_ip(), Some("1.1.1.1"));
-    }
-
-    #[test]
     fn test_resolved_ips_and_switching() {
         use std::net::IpAddr;
         use std::str::FromStr;
@@ -927,7 +898,7 @@ mod tests {
             IpAddr::from_str("1.0.0.1").unwrap(),
             IpAddr::from_str("8.8.8.8").unwrap(),
         ];
-        store.set_resolved_ips(ips.clone());
+        store.set_resolved_ips_with_active(ips.clone(), None);
 
         assert_eq!(store.resolved_ip_count(), 3);
         assert_eq!(store.active_ip(), Some(ips[0]));
@@ -960,7 +931,7 @@ mod tests {
 
         // Setting new IPs resets index
         let new_ips: Vec<IpAddr> = vec![IpAddr::from_str("9.9.9.9").unwrap()];
-        store.set_resolved_ips(new_ips.clone());
+        store.set_resolved_ips_with_active(new_ips.clone(), None);
         assert_eq!(store.active_ip_index(), 0);
         assert_eq!(store.active_ip(), Some(new_ips[0]));
 
@@ -974,10 +945,80 @@ mod tests {
         let mut store = MetricsStore::new(100, "example.com".to_string());
 
         // Empty vec
-        store.set_resolved_ips(vec![]);
+        store.set_resolved_ips_with_active(vec![], None);
         assert_eq!(store.resolved_ip_count(), 0);
         assert_eq!(store.active_ip(), None);
         assert!(!store.next_ip());
         assert!(!store.prev_ip());
+    }
+
+    #[test]
+    fn test_set_resolved_ips_with_active() {
+        use std::net::IpAddr;
+        use std::str::FromStr;
+
+        let mut store = MetricsStore::new(100, "example.com".to_string());
+
+        let v6: IpAddr = IpAddr::from_str("2606:4700:4700::1111").unwrap();
+        let v4: IpAddr = IpAddr::from_str("1.1.1.1").unwrap();
+
+        // Dual-stack answer where the probed (IPv4) address is not first:
+        // the active index must land on the probed IP, not on index 0
+        store.set_resolved_ips_with_active(vec![v6, v4], Some(v4));
+        assert_eq!(store.active_ip_index(), 1);
+        assert_eq!(store.active_ip(), Some(v4));
+        assert_eq!(store.resolved_ip_count(), 2);
+
+        // Unknown active falls back to index 0
+        let other: IpAddr = IpAddr::from_str("8.8.8.8").unwrap();
+        store.set_resolved_ips_with_active(vec![v6, v4], Some(other));
+        assert_eq!(store.active_ip_index(), 0);
+
+        // None active falls back to index 0 (passing None)
+        store.set_resolved_ips_with_active(vec![v6, v4], None);
+        assert_eq!(store.active_ip_index(), 0);
+    }
+
+    #[test]
+    fn test_ip_switch_clears_icmp_stats() {
+        let mut store = MetricsStore::new(100, "1.1.1.1".to_string());
+
+        let ips: Vec<std::net::IpAddr> = vec![
+            "1.1.1.1".parse().unwrap(),
+            "1.0.0.1".parse().unwrap(),
+            "8.8.8.8".parse().unwrap(),
+        ];
+        store.set_resolved_ips_with_active(ips.clone(), None);
+
+        // Accumulate ICMP samples on the first IP
+        for _ in 0..10 {
+            store.inc_icmp_sent();
+            store.push_icmp_rtt(40.0);
+        }
+        assert_eq!(store.icmp_rtt_history().len(), 10);
+        assert_eq!(store.icmp_aggregates().sent, 10);
+
+        // A successful switch must clear the per-endpoint ICMP statistics so
+        // the two endpoints are not blended
+        assert!(store.next_ip());
+        assert_eq!(store.active_ip(), Some(ips[1]));
+        assert!(store.icmp_rtt_history().is_empty());
+        assert_eq!(store.icmp_aggregates(), &IcmpAggregates::default());
+
+        // prev_ip behaves the same
+        store.inc_icmp_sent();
+        store.push_icmp_rtt(50.0);
+        assert!(store.prev_ip());
+        assert_eq!(store.active_ip(), Some(ips[0]));
+        assert!(store.icmp_rtt_history().is_empty());
+        assert_eq!(store.icmp_aggregates(), &IcmpAggregates::default());
+
+        // A failed switch (single IP) keeps the stats
+        store.set_resolved_ips_with_active(vec![ips[0]], None);
+        store.inc_icmp_sent();
+        store.push_icmp_rtt(60.0);
+        assert!(!store.next_ip());
+        assert!(!store.prev_ip());
+        assert_eq!(store.icmp_rtt_history().len(), 1);
     }
 }

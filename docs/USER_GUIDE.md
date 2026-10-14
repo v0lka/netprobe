@@ -11,6 +11,7 @@
 7. [Logging and Output](#logging-and-output)
 8. [Examples](#examples)
 9. [Troubleshooting](#troubleshooting)
+10. [Best Practices](#best-practices)
 
 ---
 
@@ -50,7 +51,7 @@ This starts monitoring with default settings:
 netprobe 1.1.1.1
 ```
 
-When monitoring an IP, netprobe will attempt reverse DNS lookup to display the hostname.
+When monitoring an IP literal, netprobe performs no reverse-DNS lookup (the `resolved_target` key in the `session_start` record is omitted entirely, not emitted as `null`); for domain targets, `resolved_target` carries the monitored domain name.
 
 ### Quiet Mode
 
@@ -61,6 +62,10 @@ netprobe example.com -q
 ```
 
 In quiet mode, netprobe logs to a JSONL file and outputs informational messages to stderr.
+
+### Stopping netprobe
+
+`q` or `Ctrl+C` in the dashboard (or `Ctrl+C` in quiet mode) ends the session gracefully — the terminal is restored and a final `session_end` summary is written to the JSONL log. On Linux/macOS, a delivered `SIGINT`/`SIGTERM` (e.g. `kill <pid>`) triggers the same graceful shutdown while the dashboard is open, and a delivered `SIGINT` works the same in quiet mode; a repeated signal or `Ctrl+C` while shutdown is already in progress force-exits immediately (exit code 130 for SIGINT, 143 for SIGTERM).
 
 ---
 
@@ -95,7 +100,7 @@ In quiet mode, netprobe logs to a JSONL file and outputs informational messages 
 | Option | Description | Default |
 |--------|-------------|---------|
 | `--timeout-icmp <MS>` | ICMP probe timeout in milliseconds | 2000 |
-| `--timeout-tcp <MS>` | TCP connect timeout in milliseconds | 5000 |
+| `--timeout-tcp <MS>` | TCP connect and TLS handshake timeout in milliseconds | 5000 |
 | `--timeout-dns <MS>` | DNS resolution timeout in milliseconds | 5000 |
 | `--timeout-http <MS>` | HTTP response timeout in milliseconds | 10000 |
 | `--timeout-trace <MS>` | Traceroute timeout in milliseconds | 30000 |
@@ -111,6 +116,8 @@ In quiet mode, netprobe logs to a JSONL file and outputs informational messages 
 | `-h, --help` | Print help information | - |
 | `-V, --version` | Print version information | - |
 
+All `--interval-*`/`--timeout-*` values and `--port` must be ≥ 1; `--history` accepts 1–1000000; `--http-path` must be an absolute path starting with `/`. Invalid values are rejected at startup with a usage error.
+
 ---
 
 ## TUI Dashboard
@@ -123,7 +130,7 @@ The dashboard is organized into several panels:
 
 ```
 +----------------------------------------------------------+
-| Header: Target info, resolved IP, MOS grade, uptime      |
+| Header: Target info, resolved IP, MOS grade, duration   |
 +----------------------------------------------------------+
 | Ping Panel: Sparkline, current RTT, loss%, jitter        |
 +----------------------------------------------------------+
@@ -135,7 +142,7 @@ The dashboard is organized into several panels:
 +----------------------------------------------------------+
 | Events Panel | Logs Panel: Anomalies and log messages    |
 +----------------------------------------------------------+
-| Footer: Keyboard shortcuts and status                    |
+| Footer: Keyboard shortcuts                               |
 +----------------------------------------------------------+
 ```
 
@@ -226,7 +233,7 @@ Analyzes TLS/SSL connection establishment:
 Tests HTTP/HTTPS endpoint availability:
 
 - **TTFB (Time To First Byte)**: Time until first byte of response
-- **Total Time**: Complete request/response time
+- **Total Time**: Time to receive the response status line (request write + first byte; the response body is not read)
 - **Status Code**: HTTP response code (200, 404, 500, etc.)
 
 ### Traceroute
@@ -236,9 +243,9 @@ Maps the network path to the target:
 - **Hop Number**: Position in the route
 - **IP Address**: Router IP at this hop
 - **RTT**: Round-trip time to this hop
-- **Hostname**: Reverse DNS lookup of the hop
+- **Hostname**: Hop host label — the hop's IP string on Windows; absent (no `host` field) on Linux/macOS
 
-Traceroute requires elevated privileges (raw sockets).
+On Linux/macOS, traceroute requires raw-socket privileges; on Windows `tracert.exe` needs none.
 
 ---
 
@@ -250,8 +257,8 @@ netprobe automatically detects and reports network anomalies:
 
 | Event | Description | Severity |
 |-------|-------------|----------|
-| `rtt_spike` | RTT significantly above baseline | Warning |
-| `jitter_spike` | Jitter significantly above baseline | Warning |
+| `rtt_spike` | RTT far from baseline (either direction) | Warning |
+| `jitter_spike` | Jitter far from baseline (either direction) | Warning |
 | `loss_burst` | Multiple consecutive packets lost | Critical |
 | `dns_change` | DNS resolution returned different IPs | Info |
 | `cert_expiry_warning` | TLS certificate expiring soon | Warning/Critical |
@@ -326,7 +333,7 @@ netprobe outputs structured logs in JSON Lines format (one JSON object per line)
 {
   "type": "icmp",
   "ts": "2026-03-18T14:23:05.123Z",
-  "target": "1.1.1.1",
+  "target": "example.com",
   "seq": 8142,
   "rtt_ms": 14.2,
   "ttl": 56,
@@ -343,7 +350,7 @@ netprobe outputs structured logs in JSON Lines format (one JSON object per line)
   "resolve_ms": 4.2,
   "ips": ["1.1.1.1", "1.0.0.1"],
   "ttl_secs": 286,
-  "server": "192.168.1.1",
+  "server": "192.168.1.1:53",
   "status": "ok"
 }
 ```
@@ -353,7 +360,7 @@ netprobe outputs structured logs in JSON Lines format (one JSON object per line)
 {
   "type": "tcp",
   "ts": "2026-03-18T14:23:35.050Z",
-  "target": "1.1.1.1",
+  "target": "example.com",
   "port": 443,
   "connect_ms": 15.1,
   "status": "ok"
@@ -365,11 +372,11 @@ netprobe outputs structured logs in JSON Lines format (one JSON object per line)
 {
   "type": "tls",
   "ts": "2026-03-18T14:23:35.065Z",
-  "target": "1.1.1.1",
+  "target": "example.com",
   "port": 443,
   "handshake_ms": 42.3,
   "version": "TLSv1.3",
-  "cipher": "TLS_AES_256_GCM_SHA384",
+  "cipher": "TLS13_AES_256_GCM_SHA384",
   "cert_subject": "CN=one.one.one.one",
   "cert_issuer": "CN=DigiCert",
   "cert_san": ["one.one.one.one", "1.1.1.1"],
@@ -384,7 +391,7 @@ netprobe outputs structured logs in JSON Lines format (one JSON object per line)
 {
   "type": "http",
   "ts": "2026-03-18T14:23:35.130Z",
-  "target": "1.1.1.1",
+  "target": "example.com",
   "port": 443,
   "path": "/",
   "ttfb_ms": 78.4,
@@ -399,23 +406,25 @@ netprobe outputs structured logs in JSON Lines format (one JSON object per line)
 {
   "type": "traceroute",
   "ts": "2026-03-18T14:24:05.200Z",
-  "target": "1.1.1.1",
+  "target": "example.com",
   "hops": [
     {"hop": 1, "ip": "192.168.1.1", "rtt_ms": 1.2, "host": "router.local"},
     {"hop": 2, "ip": "10.0.0.1", "rtt_ms": 4.1},
-    {"hop": 4, "ip": "1.1.1.1", "rtt_ms": 14.2, "host": "one.one.one.one"}
+    {"hop": 3, "ip": "1.1.1.1", "rtt_ms": 14.2, "host": "one.one.one.one"}
   ],
-  "hop_count": 4,
+  "hop_count": 3,
   "status": "ok"
 }
 ```
+
+On Linux/macOS, the `host` field is omitted for every hop; on Windows it carries the hop's IP string (the `tracert.exe` path) — no hostname lookup is performed.
 
 **event** - Detected anomaly:
 ```json
 {
   "type": "event",
   "ts": "2026-03-18T14:22:51Z",
-  "target": "1.1.1.1",
+  "target": "example.com",
   "event": "rtt_spike",
   "severity": "warning",
   "value": 47.1,
@@ -429,8 +438,10 @@ netprobe outputs structured logs in JSON Lines format (one JSON object per line)
 
 By default, netprobe creates a log file named:
 ```
-netprobe-<target>-<timestamp>.jsonl
+netprobe-<sanitized-target>-<timestamp>.jsonl
 ```
+
+The target is sanitized for the filename: characters outside `A-Za-z0-9._-` are replaced with `_` (monitoring the IPv6 literal `2001:db8::1` creates `netprobe-2001_db8__1-<timestamp>.jsonl`).
 
 Use `--log <path>` to specify a custom location.
 
@@ -495,7 +506,7 @@ nohup netprobe api.example.com -q --log /var/log/netprobe/api.jsonl &
 ### Troubleshooting Scenarios
 
 ```bash
-# ICMP only (no HTTP/TLS)
+# Disable the HTTP health-check (TCP/TLS probing still runs)
 netprobe problematic-host.com --no-http
 
 # Faster ICMP for quick diagnosis
@@ -514,11 +525,10 @@ netprobe remote-site.com --timeout-icmp 5000 --timeout-tcp 10000
 # Check certificate details
 netprobe example.com --interval-tcp 5
 
-# Then watch the TLS panel for:
-# - Certificate expiry date
-# - Days remaining
-# - Issuer information
-# - Subject Alternative Names
+# The TLS panel shows the negotiated TLS version, cipher, and
+# certificate days remaining.
+# Full certificate details (expiry date, issuer, subject
+# alternative names) are in the JSONL `tls` records.
 ```
 
 ---
@@ -545,7 +555,7 @@ netprobe example.com --interval-tcp 5
 
 **Solutions**:
 - Check firewall rules
-- Try TCP probe instead: `netprobe target --no-http`
+- TCP/TLS probing runs alongside ICMP regardless — check the TCP/TLS panel or test a different port with `--port` (`--no-http` only suppresses the HTTP stage)
 - Verify network connectivity with system ping
 
 ### DNS Resolution Failing

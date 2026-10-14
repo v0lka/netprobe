@@ -3,7 +3,7 @@
 //! Displays:
 //! - Hop list: number, IP (or * * *), RTT, horizontal bar proportional to RTT
 //! - Bar colors based on absolute RTT thresholds
-//! - Scroll when >10 hops
+//! - Scroll when the hop list exceeds the visible height
 //! - "traceroute unavailable: insufficient privileges" when disabled
 //! - Error display when traceroute fails
 
@@ -32,15 +32,24 @@ pub struct TracePanel<'a> {
 }
 
 impl<'a> TracePanel<'a> {
-    /// Create a new traceroute panel
-    #[allow(dead_code)]
-    pub fn new(store: &'a MetricsStore, theme: &'a Theme) -> Self {
-        Self {
-            store,
-            theme,
-            scroll_offset: 0,
-            is_focused: false,
+    /// Fit a string to a maximum display width, truncating with an ellipsis
+    /// so wide addresses (e.g. IPv6 literals) cannot overflow fixed columns.
+    fn fit_to_width(s: &str, max_width: usize) -> String {
+        if s.width() <= max_width {
+            return s.to_string();
         }
+        let mut out = String::new();
+        let mut used = 0usize;
+        for ch in s.chars() {
+            let w = ch.width().unwrap_or(1);
+            if used + w > max_width.saturating_sub(1) {
+                break;
+            }
+            out.push(ch);
+            used += w;
+        }
+        out.push('…');
+        out
     }
 
     /// Create a new traceroute panel with scroll offset and focus state
@@ -228,14 +237,16 @@ impl<'a> Widget for TracePanel<'a> {
                 Style::default().fg(self.theme.dimmed),
             ));
 
-            // IP or hostname
-            let ip_display = if let Some(ref host) = hop.host {
-                format!("{:<20}  ", host)
+            // IP or hostname (truncated to the 20-column address field so a
+            // long IPv6 literal cannot push the RTT/bar columns around)
+            let addr = if let Some(ref host) = hop.host {
+                host.clone()
             } else if let Some(ip) = hop.ip {
-                format!("{:<20}  ", ip.to_string())
+                ip.to_string()
             } else {
-                "* * *                 ".to_string()
+                "* * *".to_string()
             };
+            let ip_display = format!("{:<20}  ", Self::fit_to_width(&addr, 20));
             spans.push(Span::styled(
                 ip_display,
                 Style::default().fg(self.theme.text),
@@ -246,9 +257,15 @@ impl<'a> Widget for TracePanel<'a> {
                 let rtt_str = format!("{:>6.1}ms  ", rtt);
                 spans.push(Span::styled(rtt_str, Style::default().fg(self.theme.text)));
 
-                // Bar - reserve space for scrollbar when content overflows
-                // Text before bar: hop_num (5) + ip_display (22) + rtt_str (11) = 38 chars
-                let bar_max_width = inner.width.saturating_sub(38 + scrollbar_width) as usize;
+                // Bar - reserve space for scrollbar when content overflows.
+                // Measure the prefix from the spans actually built instead of
+                // hard-coding a character count (the RTT span widens for
+                // values of 10000 ms and above).
+                let prefix_width: usize = spans.iter().map(|s| s.content.width()).sum();
+                let bar_max_width = inner
+                    .width
+                    .saturating_sub(prefix_width as u16 + scrollbar_width)
+                    as usize;
                 if bar_max_width > 5 {
                     let bar_width = ((rtt / max_rtt) * bar_max_width as f64) as usize;
                     let bar_width = bar_width.max(1).min(bar_max_width);
@@ -358,7 +375,6 @@ mod tests {
                         host: Some("one.one.one.one".to_string()),
                     },
                 ],
-                hop_count: 5,
             }),
             None,
         );
@@ -370,7 +386,7 @@ mod tests {
     fn test_trace_panel_new() {
         let store = create_test_store();
         let theme = Theme::new();
-        let panel = TracePanel::new(&store, &theme);
+        let panel = TracePanel::with_scroll_and_focus(&store, &theme, 0, false);
 
         assert_eq!(panel.scroll_offset, 0);
     }
@@ -389,7 +405,7 @@ mod tests {
     fn test_trace_panel_rendering() {
         let store = create_test_store();
         let theme = Theme::new();
-        let panel = TracePanel::new(&store, &theme);
+        let panel = TracePanel::with_scroll_and_focus(&store, &theme, 0, false);
 
         let backend = TestBackend::new(80, 12);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -415,7 +431,7 @@ mod tests {
         store.set_traceroute_available(false);
 
         let theme = Theme::new();
-        let panel = TracePanel::new(&store, &theme);
+        let panel = TracePanel::with_scroll_and_focus(&store, &theme, 0, false);
 
         let backend = TestBackend::new(80, 8);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -438,7 +454,7 @@ mod tests {
     fn test_max_rtt() {
         let store = create_test_store();
         let theme = Theme::new();
-        let panel = TracePanel::new(&store, &theme);
+        let panel = TracePanel::with_scroll_and_focus(&store, &theme, 0, false);
 
         let hops = vec![
             HopData {
@@ -456,6 +472,19 @@ mod tests {
         ];
 
         assert_eq!(panel.max_rtt(&hops), 50.0);
+    }
+
+    #[test]
+    fn test_fit_to_width() {
+        // Short strings pass through unchanged
+        assert_eq!(TracePanel::fit_to_width("192.168.1.1", 20), "192.168.1.1");
+
+        // A full IPv6 literal (39 chars) is truncated to the field width
+        let long = "2606:4700:4700:0000:0000:0000:0000:1111";
+        let fitted = TracePanel::fit_to_width(long, 20);
+        assert!(fitted.width() <= 20);
+        assert!(fitted.ends_with('…'));
+        assert!(long.starts_with(fitted.trim_end_matches('…')));
     }
 
     #[test]

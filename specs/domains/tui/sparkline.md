@@ -13,10 +13,9 @@ Custom ratatui widget (`BrailleSparkline`) that renders time-series data as Unic
 ```rust
 pub struct BrailleSparkline<'a> {
     data: &'a [f64],
-    min: f64, max: f64,              // auto from data, or .bounds(min, max)
     height: u16,                     // terminal rows, default 2, clamped to area
     style: Style,
-    color_fn: Option<Box<dyn Fn(f64) -> Color>>,   // .color_fn(|raw_value| Color)
+    color_fn: Option<std::sync::Arc<dyn Fn(f64) -> Color + 'a>>,   // .color_fn(|raw_value| Color)
 }
 
 pub mod rtt_thresholds {           // severity colors by raw value (ms)
@@ -33,14 +32,14 @@ pub mod rtt_thresholds {           // severity colors by raw value (ms)
 Each braille character is a 2×4 dot matrix with dot bit patterns:
 
 ```
-dots:  1 4        left column  bits: 0x01, 0x02, 0x04, 0x40  (top→bottom)
-       2 5        right column bits: 0x08, 0x10, 0x20, 0x80  (top→bottom)
+dots:  1 4        left column  bits: 0x40, 0x04, 0x02, 0x01  (bottom→top: dots 7, 3, 2, 1)
+       2 5        right column bits: 0x80, 0x20, 0x10, 0x08  (bottom→top: dots 8, 6, 5, 4)
        3 6
        7 8        char = U+2800 + OR of set bits
 ```
 
 - One character column holds **2 data points** (left, right); one terminal row covers **4 vertical levels**; with the default height 2 → 8 levels total.
-- `total_levels = 4 × height`. A normalized value maps to `level = floor(value × total_levels)` clamped to `total_levels − 1`; in each row, dot `i` is set when `level ≥ row_start + i` (bottom-up fill).
+- `total_levels = 4 × height`. A normalized value maps to `level = floor(value × total_levels)` clamped to `total_levels − 1`; in each row, dot `i` is set when `level ≥ row_start + i`, and row bands are indexed from the bottom (`row_start = (height − 1 − row) × 4`) — so higher values fill dots closer to the top of the chart (bottom-up fill).
 
 ### Rendering pipeline (`Widget::render`)
 
@@ -48,11 +47,11 @@ dots:  1 4        left column  bits: 0x01, 0x02, 0x04, 0x40  (top→bottom)
 2. Fit data to `width × 2` points: take the **tail** if longer; pad with `min` at the **beginning** if shorter (chart grows from the right).
 3. Normalize each point: `(v − min) / (max − min)` clamped to `[0, 1]`; degenerate range (`max == min`) normalizes to `0.5`.
 4. Per column: build the braille char from both points; color = `color_fn(avg(raw_left, raw_right))` if set, else the style's `fg` (default `Color::White`).
-5. Default bounds are the data's min/max (min raised by +1 spread if flat), so the chart auto-scales per frame.
+5. Default bounds are the min/max of the sampled tail, computed in `render` (a single old extreme cannot pin the visible scale); when the range is flat, `max` is raised to `min + 1` so the chart stays non-degenerate and auto-scales per frame.
 
 ### Usage
 
-Panels pass a history slice (`store.*_history()`), optional explicit bounds, and a `color_fn` built from `rtt_thresholds` so colors encode absolute value (severity), while dot height encodes relative position within the window's range.
+Panels pass a history slice (`store.*_history()`) and a `color_fn` built from `rtt_thresholds` so colors encode absolute value (severity), while dot height encodes relative position within the visible window's range.
 
 ## Error Handling
 
@@ -60,9 +59,9 @@ Rendering is infallible: invalid codepoints fall back to `' '`; out-of-area cell
 
 ## Invariants
 
-1. The widget reads only the borrowed slice — it never touches the store or terminal state.
+1. The widget reads only the borrowed slice — all its state lives in its own fields and the `render` arguments.
 2. Data density is exactly 2 points per terminal column (after tail-sampling/padding).
-3. Auto-bounds are recomputed from the visible data on every render; explicit `.bounds()` overrides them for the widget's lifetime.
+3. Auto-bounds are recomputed from the visible data (the rendered tail) on every render.
 4. Color reflects the raw data value; height reflects the normalized value — the two encodings are independent.
 
 ## Related Specs

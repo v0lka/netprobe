@@ -12,7 +12,7 @@ use std::time::Duration;
 use surge_ping::{Client, Config as PingConfig, ICMP, PingIdentifier, PingSequence};
 use tokio::process::Command;
 use tokio::sync::mpsc;
-use tokio::time::{Instant, interval};
+use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 
 /// Result of a single ICMP probe with duplicate/reorder detection
@@ -38,15 +38,24 @@ pub struct IcmpProber {
 
 impl IcmpProber {
     /// Create a new ICMP prober with automatic strategy selection
-    pub async fn new(target: IpAddr, timeout: Duration) -> Result<(Self, IcmpStrategy)> {
+    ///
+    /// Construction is infallible: when neither the unprivileged (SOCK_DGRAM)
+    /// nor the raw-socket (SOCK_RAW) client can be created, the prober falls
+    /// back to spawning the platform `ping` subprocess.
+    pub async fn new(target: IpAddr, timeout: Duration) -> (Self, IcmpStrategy) {
+        // Select the ICMP family from the target address: a V6 target with a
+        // V4 client only surfaces as SocketError/timeout instead of a
+        // working ping.
+        let kind = if target.is_ipv6() { ICMP::V6 } else { ICMP::V4 };
+
         // Try unprivileged socket first (SOCK_DGRAM)
         let config = PingConfig::builder()
-            .kind(ICMP::V4)
+            .kind(kind)
             .sock_type_hint(Type::DGRAM)
             .build();
 
-        match Client::new(&config) {
-            Ok(client) => Ok((
+        if let Ok(client) = Client::new(&config) {
+            return (
                 Self {
                     target,
                     timeout,
@@ -56,43 +65,41 @@ impl IcmpProber {
                     last_seq: 0,
                 },
                 IcmpStrategy::Unprivileged,
-            )),
-            Err(_) => {
-                // Try raw socket (SOCK_RAW)
-                let config = PingConfig::builder()
-                    .kind(ICMP::V4)
-                    .sock_type_hint(Type::RAW)
-                    .build();
-
-                match Client::new(&config) {
-                    Ok(client) => Ok((
-                        Self {
-                            target,
-                            timeout,
-                            strategy: IcmpStrategy::Raw,
-                            client: Some(client),
-                            seen_seqs: std::collections::HashSet::new(),
-                            last_seq: 0,
-                        },
-                        IcmpStrategy::Raw,
-                    )),
-                    Err(_) => {
-                        // Fall back to subprocess
-                        Ok((
-                            Self {
-                                target,
-                                timeout,
-                                strategy: IcmpStrategy::Subprocess,
-                                client: None,
-                                seen_seqs: std::collections::HashSet::new(),
-                                last_seq: 0,
-                            },
-                            IcmpStrategy::Subprocess,
-                        ))
-                    }
-                }
-            }
+            );
         }
+
+        // Try raw socket (SOCK_RAW)
+        let config = PingConfig::builder()
+            .kind(kind)
+            .sock_type_hint(Type::RAW)
+            .build();
+
+        if let Ok(client) = Client::new(&config) {
+            return (
+                Self {
+                    target,
+                    timeout,
+                    strategy: IcmpStrategy::Raw,
+                    client: Some(client),
+                    seen_seqs: std::collections::HashSet::new(),
+                    last_seq: 0,
+                },
+                IcmpStrategy::Raw,
+            );
+        }
+
+        // Fall back to subprocess
+        (
+            Self {
+                target,
+                timeout,
+                strategy: IcmpStrategy::Subprocess,
+                client: None,
+                seen_seqs: std::collections::HashSet::new(),
+                last_seq: 0,
+            },
+            IcmpStrategy::Subprocess,
+        )
     }
 
     /// Perform a single ping
@@ -111,7 +118,6 @@ impl IcmpProber {
             .ok_or_else(|| ProbeError::SocketError("No client available".to_string()))?;
 
         let payload = vec![0; 56];
-        let _start = Instant::now();
 
         // Create a Pinger for this specific target
         let mut pinger = client.pinger(self.target, PingIdentifier(0)).await;
@@ -126,12 +132,17 @@ impl IcmpProber {
                     surge_ping::IcmpPacket::V6(_) => None, // IPv6 doesn't have TTL in the same way
                 };
 
-                // Check for duplicates and reordering
-                let is_duplicate = !self.seen_seqs.insert(seq);
-                let is_reordered = seq < self.last_seq;
+                // Check for duplicates and reordering using the sequence
+                // number *echoed by the reply*, not our locally generated
+                // probe index: every probe passes a fresh, strictly
+                // increasing index, so tracking our own indices can never
+                // observe a duplicate or reorder.
+                let reply_seq = packet.get_sequence().into_u16();
+                let is_duplicate = !self.seen_seqs.insert(reply_seq);
+                let is_reordered = reply_seq < self.last_seq;
 
-                if seq > self.last_seq {
-                    self.last_seq = seq;
+                if reply_seq > self.last_seq {
+                    self.last_seq = reply_seq;
                 }
 
                 Ok(IcmpResult {
@@ -143,14 +154,21 @@ impl IcmpProber {
                     reordered: is_reordered,
                 })
             }
-            Ok(Err(_)) => Ok(IcmpResult {
-                rtt: None,
-                ttl: None,
-                seq,
-                status: IcmpStatus::Timeout,
-                duplicate: false,
-                reordered: false,
-            }),
+            Ok(Err(e)) => {
+                // An ICMP error that is not a lost packet (e.g. destination
+                // unreachable, time exceeded, malformed reply) is an Error,
+                // not a Timeout: only the elapsed outer timeout below is a
+                // Timeout.
+                tracing::debug!("ICMP probe error: {}", e);
+                Ok(IcmpResult {
+                    rtt: None,
+                    ttl: None,
+                    seq,
+                    status: IcmpStatus::Error,
+                    duplicate: false,
+                    reordered: false,
+                })
+            }
             Err(_) => Ok(IcmpResult {
                 rtt: None,
                 ttl: None,
@@ -168,31 +186,85 @@ impl IcmpProber {
         let timeout_sec = self.timeout.as_secs().max(1);
 
         #[cfg(target_os = "windows")]
-        let output = Command::new("ping")
-            .args([
+        let mut command = {
+            let mut c = Command::new("ping");
+            c.args([
                 "-n",
                 "1",
                 "-w",
                 &(timeout_sec * 1000).to_string(),
                 &target_str,
-            ])
-            .output()
-            .await
-            .map_err(|e| ProbeError::Other(format!("Failed to execute ping: {}", e)))?;
+            ]);
+            c
+        };
 
         #[cfg(not(target_os = "windows"))]
-        let output = Command::new("ping")
-            .args(["-c", "1", "-W", &timeout_sec.to_string(), &target_str])
-            .output()
-            .await
-            .map_err(|e| ProbeError::Other(format!("Failed to execute ping: {}", e)))?;
+        let mut command = {
+            // `ping -W` takes seconds on Linux iputils but *milliseconds* on
+            // macOS/BSD ("Time in MilliSeconds to wait for a reply for each
+            // packet sent").
+            let wait_time = if cfg!(target_os = "macos") {
+                (timeout_sec * 1000).to_string()
+            } else {
+                timeout_sec.to_string()
+            };
+            // macOS `ping` rejects IPv6 literals (and has no -6 flag); its
+            // `ping6` counterpart is the IPv6 fallback. Linux iputils and
+            // Windows `ping` select the family from the target themselves.
+            // (`args` returns a handle borrowing the command, so the command
+            // is bound first and the arguments attached as a statement.)
+            if cfg!(target_os = "macos") && self.target.is_ipv6() {
+                let mut c = Command::new("ping6");
+                c.args(["-c", "1", &target_str]);
+                c
+            } else {
+                let mut c = Command::new("ping");
+                c.args(["-c", "1", "-W", &wait_time, &target_str]);
+                c
+            }
+        };
+
+        // Kill the child when this future is dropped mid-wait: the outer
+        // `tokio::time::timeout` below abandons `command.output()` at the
+        // deadline, and without `kill_on_drop` an unresponsive target would
+        // leave an orphaned `ping`/`ping6` process running past the probe.
+        command.kill_on_drop(true);
+
+        // Bound the subprocess wait ourselves as a platform-agnostic backstop:
+        // macOS `ping6` takes no wait flag we can rely on, and a wedged `ping`
+        // must not stall the loop's cadence beyond `timeout_icmp_ms` (the
+        // per-platform wait flags above already bound the normal paths).
+        let output = match tokio::time::timeout(self.timeout, command.output()).await {
+            Ok(result) => {
+                result.map_err(|e| ProbeError::Other(format!("Failed to execute ping: {}", e)))?
+            }
+            // Killed at the deadline without answering: a lost probe
+            Err(_) => {
+                return Ok(IcmpResult {
+                    rtt: None,
+                    ttl: None,
+                    seq,
+                    status: IcmpStatus::Timeout,
+                    duplicate: false,
+                    reordered: false,
+                });
+            }
+        };
 
         let stdout = String::from_utf8_lossy(&output.stdout);
 
-        // Check for timeout indicators
+        // Check for timeout indicators across platforms:
+        // - Windows: "Request timed out."
+        // - macOS/BSD: "Request timeout for icmp_seq N", "100.0% packet loss",
+        //   "0 packets received"
+        // - Linux iputils: "Request timeout for icmp_seq N", "100% packet
+        //   loss", "0 received"
         if stdout.contains("Request timed out")
+            || stdout.contains("Request timeout")
             || stdout.contains("100% packet loss")
+            || stdout.contains("100.0% packet loss")
             || stdout.contains("0 received")
+            || stdout.contains("0 packets received")
             || stdout.contains("Destination Host Unreachable")
         {
             return Ok(IcmpResult {
@@ -208,28 +280,21 @@ impl IcmpProber {
         // Parse RTT and TTL from output
         let (rtt, ttl) = parse_ping_output(&stdout)?;
 
-        // Check for duplicates and reordering
-        let is_duplicate = !self.seen_seqs.insert(seq);
-        let is_reordered = seq < self.last_seq;
-
-        if seq > self.last_seq {
-            self.last_seq = seq;
-        }
-
+        // One-shot `ping -c 1` cannot observe duplicates or reordering: each
+        // attempt runs an independent process whose reply echoes that run's
+        // own constant counter (`icmp_seq=0` on macOS/BSD and `ping6`,
+        // `icmp_seq=1` on Linux iputils; Windows omits it entirely), so the
+        // echoed value carries no session-unique information. Both flags stay
+        // `false` on this path; duplicate/reorder detection is only
+        // meaningful on the in-process surge path.
         Ok(IcmpResult {
             rtt,
             ttl,
             seq,
             status: IcmpStatus::Ok,
-            duplicate: is_duplicate,
-            reordered: is_reordered,
+            duplicate: false,
+            reordered: false,
         })
-    }
-
-    /// Get the current strategy
-    #[allow(dead_code)]
-    pub fn strategy(&self) -> IcmpStrategy {
-        self.strategy
     }
 
     /// Update the target IP address
@@ -249,7 +314,8 @@ fn parse_ping_output(output: &str) -> Result<(Option<Duration>, Option<u8>), Pro
 
     // Try macOS/Linux format first
     let macos_regex = Regex::new(r"ttl[=:](\d+).*time[=:]([\d.]+)\s*ms").unwrap();
-    let windows_regex = Regex::new(r"time[=:]([\d.]+)ms.*TTL[=:](\d+)").unwrap();
+    // Windows also prints `time<1ms` for sub-millisecond replies (`<` form)
+    let windows_regex = Regex::new(r"time[=:<]([\d.]+)ms.*TTL[=:](\d+)").unwrap();
 
     if let Some(caps) = macos_regex.captures(output) {
         let ttl = caps.get(1).and_then(|m| m.as_str().parse::<u8>().ok());
@@ -272,6 +338,7 @@ fn parse_ping_output(output: &str) -> Result<(Option<Duration>, Option<u8>), Pro
 }
 
 /// Main ICMP probe loop
+#[allow(clippy::too_many_arguments)]
 pub async fn icmp_probe_loop(
     mut prober: IcmpProber,
     store: SharedStore,
@@ -280,13 +347,15 @@ pub async fn icmp_probe_loop(
     target: String,
     cancel: CancellationToken,
     mut ip_rx: tokio::sync::watch::Receiver<std::net::IpAddr>,
+    reset_notify: std::sync::Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let mut ticker = interval(Duration::from_millis(interval_ms));
     let mut seq: u16 = 0;
     let mut detector = AnomalyDetector::new();
 
     loop {
-        // Wait for next tick, cancellation, or IP change (biased to prioritize cancellation)
+        // Wait for next tick, cancellation, IP change, or statistics reset
+        // (biased to prioritize cancellation)
         tokio::select! {
             biased;
 
@@ -294,12 +363,30 @@ pub async fn icmp_probe_loop(
                 tracing::info!("ICMP probe loop cancelled");
                 break;
             }
-            _ = ip_rx.changed() => {
+            res = ip_rx.changed() => {
+                // Closed channel: run_tui (the only sender) is gone — treat
+                // it as shutdown rather than an IP change, so the loop does
+                // not run one more probe on the TUI error-exit path
+                if res.is_err() {
+                    break;
+                }
                 let new_ip = *ip_rx.borrow();
                 tracing::info!("ICMP probe updating target to: {}", new_ip);
                 prober.update_target(new_ip);
                 // Reset sequence tracking on IP change
                 seq = 0;
+                // Start a fresh anomaly-detection baseline: the previous
+                // target's RTT/jitter samples must not score the new
+                // endpoint's first samples
+                detector = AnomalyDetector::new();
+            }
+            _ = reset_notify.notified() => {
+                tracing::info!("ICMP anomaly detector reset (statistics reset)");
+                // The store's statistics were reset (r hotkey); the detector
+                // must re-warm against the fresh baseline instead of scoring
+                // new samples against pre-reset windows
+                detector = AnomalyDetector::new();
+                continue;
             }
             _ = ticker.tick() => {}
         }
@@ -319,39 +406,50 @@ pub async fn icmp_probe_loop(
         // Perform ping
         match prober.ping(seq).await {
             Ok(result) => {
-                let mut store = store.write().await;
+                // Update the store in one short critical section: the write
+                // guard must never be held across the channel sends below
+                // (a full `log_tx` would otherwise stall the TUI's read lock
+                // while the sender awaits backpressure)
+                let anomalies = {
+                    let mut store = store.write().await;
 
-                // Handle duplicate detection
-                if result.duplicate {
-                    store.inc_icmp_duplicate();
-                }
-
-                // Handle reordering detection
-                if result.reordered {
-                    store.inc_icmp_reordered();
-                }
-
-                // Process result with anomaly detector
-                let anomalies = if let Some(rtt) = result.rtt {
-                    let rtt_ms = rtt.as_secs_f64() * 1000.0;
-                    store.push_icmp_rtt(rtt_ms);
-                    detector.on_icmp_ok(rtt_ms)
-                } else {
-                    // Timeout - check for loss burst
-                    if let Some(anomaly) = detector.on_icmp_loss() {
-                        vec![anomaly]
-                    } else {
-                        vec![]
+                    // Handle duplicate detection
+                    if result.duplicate {
+                        store.inc_icmp_duplicate();
                     }
+
+                    // Handle reordering detection
+                    if result.reordered {
+                        store.inc_icmp_reordered();
+                    }
+
+                    // Process result with anomaly detector
+                    let anomalies = if let Some(rtt) = result.rtt {
+                        let rtt_ms = rtt.as_secs_f64() * 1000.0;
+                        store.push_icmp_rtt(rtt_ms);
+                        detector.on_icmp_ok(rtt_ms)
+                    } else {
+                        // Timeout - check for loss burst
+                        if let Some(anomaly) = detector.on_icmp_loss() {
+                            vec![anomaly]
+                        } else {
+                            vec![]
+                        }
+                    };
+
+                    for anomaly in &anomalies {
+                        store.push_event(
+                            anomaly.event_type.clone(),
+                            anomaly.severity.clone(),
+                            anomaly.message.clone(),
+                        );
+                    }
+                    anomalies
                 };
 
-                // Send anomaly events to store and logger
+                // The write guard is dropped above: the sends below never
+                // hold it
                 for anomaly in &anomalies {
-                    store.push_event(
-                        anomaly.event_type.clone(),
-                        anomaly.severity.clone(),
-                        anomaly.message.clone(),
-                    );
                     let event_record = detector.to_event_record(anomaly, &target);
                     let _ = log_tx.send(LogRecord::Event(event_record)).await;
                 }
@@ -371,12 +469,14 @@ pub async fn icmp_probe_loop(
             Err(e) => {
                 // Check for loss burst on error
                 if let Some(anomaly) = detector.on_icmp_loss() {
-                    let mut store = store.write().await;
-                    store.push_event(
-                        anomaly.event_type.clone(),
-                        anomaly.severity.clone(),
-                        anomaly.message.clone(),
-                    );
+                    {
+                        let mut store = store.write().await;
+                        store.push_event(
+                            anomaly.event_type.clone(),
+                            anomaly.severity.clone(),
+                            anomaly.message.clone(),
+                        );
+                    }
                     let event_record = detector.to_event_record(&anomaly, &target);
                     let _ = log_tx.send(LogRecord::Event(event_record)).await;
                 }
@@ -445,6 +545,18 @@ mod tests {
         assert!(rtt.is_some());
         assert!((rtt.unwrap().as_secs_f64() * 1000.0 - 23.456).abs() < 0.001);
         assert_eq!(ttl, Some(117));
+    }
+
+    #[test]
+    fn test_parse_ping_output_windows_sub_millisecond() {
+        // Windows prints `time<1ms` for fast replies; this must parse as a
+        // successful reply, not an error.
+        let output = "Reply from 192.168.1.1: bytes=32 time<1ms TTL=64";
+        let (rtt, ttl) = parse_ping_output(output).unwrap();
+
+        assert!(rtt.is_some());
+        assert!((rtt.unwrap().as_secs_f64() * 1000.0 - 1.0).abs() < 0.001);
+        assert_eq!(ttl, Some(64));
     }
 
     #[test]

@@ -124,15 +124,18 @@ impl<'a> Widget for DnsPanel<'a> {
                     Style::default().fg(self.theme.text),
                 ));
 
-                // IPs - show first IP only with count if multiple
+                // IPs - show first IP only with count if multiple; render an
+                // empty state rather than indexing a possibly-empty list
                 spans.push(Span::styled(
                     "   IPs: ",
                     Style::default().fg(self.theme.dimmed),
                 ));
-                let ip_str = if data.ips.len() > 1 {
-                    format!("{} ... ({} total)", data.ips[0], data.ips.len())
-                } else {
-                    data.ips[0].to_string()
+                let ip_str = match data.ips.first() {
+                    Some(ip) if data.ips.len() > 1 => {
+                        format!("{} ... ({} total)", ip, data.ips.len())
+                    }
+                    Some(ip) => ip.to_string(),
+                    None => "—".to_string(),
                 };
                 spans.push(Span::styled(ip_str, Style::default().fg(self.theme.text)));
 
@@ -227,8 +230,45 @@ mod tests {
         let theme = Theme::new();
         let panel = DnsPanel::new(&store, &theme);
 
-        // Just verify it doesn't panic
-        let _ = panel.format_value(5.0, "ms");
+        // format_value picks precision by magnitude
+        assert_eq!(panel.format_value(5.0, "ms"), "5.00ms");
+        assert_eq!(panel.format_value(5.123, "ms"), "5.12ms");
+        assert_eq!(panel.format_value(50.5, "ms"), "50.5ms");
+        assert_eq!(panel.format_value(150.0, "ms"), "150ms");
+    }
+
+    #[test]
+    fn test_dns_panel_empty_ips_does_not_panic() {
+        // A successful resolution with an empty address set is legal store
+        // state; rendering it must show an empty-state placeholder instead
+        // of indexing ips[0].
+        let mut store = MetricsStore::new(100, "example.com".to_string());
+        store.push_dns_resolve(5.0);
+        store.set_latest_dns(
+            Some(DnsData {
+                resolve_ms: 5.0,
+                ips: vec![],
+                ttl_secs: None,
+                server: "8.8.8.8".to_string(),
+            }),
+            None,
+        );
+
+        let theme = Theme::new();
+        let panel = DnsPanel::new(&store, &theme);
+
+        let backend = TestBackend::new(80, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                f.render_widget(panel, area);
+            })
+            .unwrap();
+
+        let buffer = terminal.backend().buffer().clone();
+        let content: String = buffer.content.iter().map(|c| c.symbol()).collect();
+        assert!(content.contains("—"));
     }
 
     #[test]

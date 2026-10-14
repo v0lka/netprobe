@@ -9,6 +9,7 @@
 use crate::store::MetricsStore;
 use crate::tui::sparkline::{BrailleSparkline, gradient_for_rtt};
 use crate::tui::theme::Theme;
+use crate::util::calculate_percentile;
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect},
@@ -47,24 +48,18 @@ impl<'a> PingPanel<'a> {
         }
     }
 
-    /// Calculate percentiles from RTT history
+    /// Calculate percentiles from RTT history (lower-index quantile, via the
+    /// shared util helper so panel thresholds match the store's aggregates)
     fn calculate_percentiles(&self) -> (f64, f64, f64) {
         let history = self.store.icmp_rtt_history();
         if history.len() < 2 {
             return (0.0, 0.0, 0.0);
         }
 
-        let mut sorted: Vec<f64> = history.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-
-        let p25_idx = (sorted.len() as f64 * 0.25) as usize;
-        let p75_idx = (sorted.len() as f64 * 0.75) as usize;
-        let p95_idx = (sorted.len() as f64 * 0.95) as usize;
-
         (
-            sorted[p25_idx.min(sorted.len() - 1)],
-            sorted[p75_idx.min(sorted.len() - 1)],
-            sorted[p95_idx.min(sorted.len() - 1)],
+            calculate_percentile(history, 0.25),
+            calculate_percentile(history, 0.75),
+            calculate_percentile(history, 0.95),
         )
     }
 }
@@ -125,7 +120,7 @@ impl<'a> Widget for PingPanel<'a> {
         }
 
         // Render min/max labels under sparkline
-        if chunks[1].width > 0 {
+        if chunks[1].width > 0 && chunks[1].height > 0 {
             let min_label = format!("{:.1}ms", agg.min_rtt);
             let max_label = format!("{:.1}ms", agg.max_rtt);
 
@@ -157,8 +152,8 @@ impl<'a> Widget for PingPanel<'a> {
             }
         }
 
-        // Render metrics row 1: Now, Avg, Min, Max, p95
-        if chunks[2].width > 0 {
+        // Render metrics row 1: Now, Avg, Min, Max (+ p95 in full mode)
+        if chunks[2].width > 0 && chunks[2].height > 0 {
             let latest_rtt = history.last().copied().unwrap_or(0.0);
             let rtt_color = if history.len() >= 2 {
                 self.theme.color_for_rtt(latest_rtt, p25, p75, p95)
@@ -166,26 +161,7 @@ impl<'a> Widget for PingPanel<'a> {
                 self.theme.text
             };
 
-            let _metrics_text = if self.compact {
-                format!(
-                    "Now: {}  Avg: {}  Min: {}  Max: {}",
-                    self.format_value(latest_rtt, "ms"),
-                    self.format_value(agg.avg_rtt, "ms"),
-                    self.format_value(agg.min_rtt, "ms"),
-                    self.format_value(agg.max_rtt, "ms"),
-                )
-            } else {
-                format!(
-                    "Now: {}  Avg: {}  Min: {}  Max: {}  p95: {}",
-                    self.format_value(latest_rtt, "ms"),
-                    self.format_value(agg.avg_rtt, "ms"),
-                    self.format_value(agg.min_rtt, "ms"),
-                    self.format_value(agg.max_rtt, "ms"),
-                    self.format_value(agg.p95_rtt, "ms"),
-                )
-            };
-
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled("Now: ", Style::default().fg(self.theme.dimmed)),
                 Span::styled(
                     self.format_value(latest_rtt, "ms"),
@@ -206,13 +182,22 @@ impl<'a> Widget for PingPanel<'a> {
                     self.format_value(agg.max_rtt, "ms"),
                     Style::default().fg(self.theme.warning),
                 ),
-            ]);
+            ];
 
+            // Full mode appends p95; compact mode stays with the four core
+            // metrics, so the flag actually changes the rendered row.
             if !self.compact {
-                // Add p95 with color
-                let _p95_color = self.theme.color_for_rtt(agg.p95_rtt, p25, p75, p95);
-                // We already rendered the basic line, so skip extended metrics in compact mode
+                let p95_color = self.theme.color_for_rtt(agg.p95_rtt, p25, p75, p95);
+                spans.push(Span::styled(
+                    "  p95: ",
+                    Style::default().fg(self.theme.dimmed),
+                ));
+                spans.push(Span::styled(
+                    self.format_value(agg.p95_rtt, "ms"),
+                    Style::default().fg(p95_color),
+                ));
             }
+            let line = Line::from(spans);
 
             // Render the line
             let x = chunks[2].x;
@@ -240,7 +225,7 @@ impl<'a> Widget for PingPanel<'a> {
         }
 
         // Render metrics row 2: Jitter, Loss%, Sent, Recv
-        if chunks[3].width > 0 {
+        if chunks[3].width > 0 && chunks[3].height > 0 {
             let loss_color = self.theme.color_for_loss(agg.loss_pct);
 
             let line = Line::from(vec![
@@ -359,6 +344,34 @@ mod tests {
 
         // Should contain "ping" in the title
         assert!(content.contains("ping"));
+    }
+
+    #[test]
+    fn test_ping_panel_p95_full_mode_only() {
+        let store = create_test_store();
+        let theme = Theme::new();
+
+        let render_to_string = |compact: bool| {
+            let panel = PingPanel::new(&store, &theme, compact);
+            let backend = TestBackend::new(120, 10);
+            let mut terminal = Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    f.render_widget(panel, area);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+
+        // Full mode renders the p95 metric; compact mode omits it.
+        assert!(render_to_string(false).contains("p95"));
+        assert!(!render_to_string(true).contains("p95"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 //! Anomaly detection
 
-use crate::models::{EventRecord, LogRecord, Severity};
+use crate::models::{EventRecord, Severity};
 use chrono::Utc;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -106,18 +106,6 @@ impl WindowedWelford {
     pub fn is_warm(&self) -> bool {
         self.count >= self.warm_up
     }
-
-    /// Get the number of samples
-    #[allow(dead_code)]
-    pub fn count(&self) -> usize {
-        self.count
-    }
-
-    /// Get the window size
-    #[allow(dead_code)]
-    pub fn window_size(&self) -> usize {
-        self.window_size
-    }
 }
 
 /// Anomaly event information
@@ -178,15 +166,27 @@ impl AnomalyDetector {
             if rtt_stddev > 0.0 {
                 let rtt_sigma = (rtt_ms - rtt_mean) / rtt_stddev;
                 if rtt_sigma.abs() > 3.0 {
+                    // The rule is two-sided (|sigma| > 3), so make the
+                    // payload directional: `threshold` is the boundary the
+                    // sample actually crossed and the message says which side
+                    // of the mean it was on.
+                    let above = rtt_sigma > 0.0;
+                    let threshold = if above {
+                        rtt_mean + 3.0 * rtt_stddev
+                    } else {
+                        rtt_mean - 3.0 * rtt_stddev
+                    };
                     anomalies.push(AnomalyEvent {
                         event_type: "rtt_spike".to_string(),
                         severity: Severity::Warning,
                         value: Some(rtt_ms),
-                        threshold: Some(rtt_mean + 3.0 * rtt_stddev),
+                        threshold: Some(threshold),
                         sigma: Some(rtt_sigma),
                         message: format!(
-                            "RTT spike: {:.1}ms ({:.1}σ above mean)",
-                            rtt_ms, rtt_sigma
+                            "RTT spike: {:.1}ms ({:.1}σ {} mean)",
+                            rtt_ms,
+                            rtt_sigma,
+                            if above { "above" } else { "below" }
                         ),
                     });
                 }
@@ -200,15 +200,23 @@ impl AnomalyDetector {
             if jitter_stddev > 0.0 {
                 let jitter_sigma = (jitter - jitter_mean) / jitter_stddev;
                 if jitter_sigma.abs() > 3.0 {
+                    let above = jitter_sigma > 0.0;
+                    let threshold = if above {
+                        jitter_mean + 3.0 * jitter_stddev
+                    } else {
+                        jitter_mean - 3.0 * jitter_stddev
+                    };
                     anomalies.push(AnomalyEvent {
                         event_type: "jitter_spike".to_string(),
                         severity: Severity::Warning,
                         value: Some(jitter),
-                        threshold: Some(jitter_mean + 3.0 * jitter_stddev),
+                        threshold: Some(threshold),
                         sigma: Some(jitter_sigma),
                         message: format!(
-                            "Jitter spike: {:.1}ms ({:.1}σ above mean)",
-                            jitter, jitter_sigma
+                            "Jitter spike: {:.1}ms ({:.1}σ {} mean)",
+                            jitter,
+                            jitter_sigma,
+                            if above { "above" } else { "below" }
                         ),
                     });
                 }
@@ -226,11 +234,13 @@ impl AnomalyDetector {
     }
 
     /// Process an ICMP loss
-    /// Returns Some(AnomalyEvent) if loss_burst detected (3+ consecutive losses)
+    /// Returns Some(AnomalyEvent) when a loss burst *begins* (3 consecutive
+    /// losses). Further consecutive losses do not re-fire the event, so a
+    /// sustained outage cannot flood the event deque or the JSONL log.
     pub fn on_icmp_loss(&mut self) -> Option<AnomalyEvent> {
         self.consecutive_losses += 1;
 
-        if self.consecutive_losses >= 3 {
+        if self.consecutive_losses == 3 {
             Some(AnomalyEvent {
                 event_type: "loss_burst".to_string(),
                 severity: Severity::Critical,
@@ -307,6 +317,11 @@ impl AnomalyDetector {
     }
 
     /// Process hop RTT anomaly
+    ///
+    /// `sigma` is the z-score of `rtt` against the hop's window; `stddev` is
+    /// that window's standard deviation, so `threshold` is the 2σ boundary
+    /// (`mean ± 2·stddev`) the sample actually crossed — not a multiple of
+    /// the z-score.
     pub fn on_hop_rtt_anomaly(
         &self,
         hop: u8,
@@ -314,13 +329,19 @@ impl AnomalyDetector {
         rtt: f64,
         mean: f64,
         sigma: f64,
+        stddev: f64,
     ) -> AnomalyEvent {
         let ip_str = ip.map(|i| i.to_string()).unwrap_or_else(|| "*".to_string());
+        let threshold = if sigma > 0.0 {
+            mean + 2.0 * stddev
+        } else {
+            mean - 2.0 * stddev
+        };
         AnomalyEvent {
             event_type: "hop_rtt_anomaly".to_string(),
             severity: Severity::Warning,
             value: Some(rtt),
-            threshold: Some(mean + 2.0 * sigma.abs()),
+            threshold: Some(threshold),
             sigma: Some(sigma),
             message: format!(
                 "Hop {} ({}) RTT anomaly: {:.1}ms (mean: {:.1}ms, σ: {:.1})",
@@ -396,12 +417,6 @@ impl AnomalyDetector {
             message: event.message.clone(),
         }
     }
-
-    /// Convert an AnomalyEvent to a LogRecord
-    #[allow(dead_code)]
-    pub fn to_log_record(&self, event: &AnomalyEvent, target: &str) -> LogRecord {
-        LogRecord::Event(self.to_event_record(event, target))
-    }
 }
 
 impl Default for AnomalyDetector {
@@ -425,7 +440,8 @@ mod tests {
 
         // Mean should be 3.0
         assert!((w.mean() - 3.0).abs() < 0.001);
-        // Not warm yet (need 5 samples, have exactly 5)
+        // Warm now: is_warm() is count >= warm_up, so exactly 5 samples
+        // (warm_up = 5) already satisfies it
         assert!(w.is_warm());
     }
 
@@ -477,14 +493,14 @@ mod tests {
     #[test]
     fn test_windowed_welford_icmp_profile() {
         let w = WindowedWelford::icmp();
-        assert_eq!(w.window_size(), 60);
+        assert_eq!(w.window_size, 60);
         assert!(!w.is_warm()); // 0 samples, need 30
     }
 
     #[test]
     fn test_windowed_welford_hop_profile() {
         let w = WindowedWelford::hop();
-        assert_eq!(w.window_size(), 10);
+        assert_eq!(w.window_size, 10);
         assert!(!w.is_warm()); // 0 samples, need 5
     }
 
@@ -631,12 +647,16 @@ mod tests {
         let detector = AnomalyDetector::new();
 
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
-        let event = detector.on_hop_rtt_anomaly(4, Some(ip), 50.0, 20.0, 3.5);
+        // mean 20ms, stddev 10ms, observed 50ms -> z-score 3.0
+        let event = detector.on_hop_rtt_anomaly(4, Some(ip), 50.0, 20.0, 3.0, 10.0);
 
         assert_eq!(event.event_type, "hop_rtt_anomaly");
         assert_eq!(event.severity, Severity::Warning);
         assert_eq!(event.value, Some(50.0));
-        assert_eq!(event.sigma, Some(3.5));
+        assert_eq!(event.sigma, Some(3.0));
+        // The threshold is the true 2σ boundary (mean + 2·stddev = 40ms),
+        // not a multiple of the z-score
+        assert_eq!(event.threshold, Some(40.0));
         assert!(event.message.contains("Hop 4"));
         assert!(event.message.contains("10.0.0.1"));
     }
@@ -689,17 +709,53 @@ mod tests {
     fn test_anomaly_detector_jitter_spike() {
         let mut detector = AnomalyDetector::new();
 
-        // 30 stable alternating pings: 20, 20, 20... (jitter = 0)
-        for _ in 0..30 {
-            let _ = detector.on_icmp_ok(20.0);
+        // Warm up both windows with varied RTTs (20/21/22 cycle) so their
+        // stddevs are non-zero; the sigma checks only run once warm
+        for i in 0..30 {
+            let rtt = 20.0 + (i % 3) as f64;
+            let anomalies = detector.on_icmp_ok(rtt);
+            assert!(anomalies.is_empty(), "no anomalies while warming up");
         }
 
-        // Now create a jitter spike: 20 -> 100 (jitter = 80)
-        let _anomalies = detector.on_icmp_ok(100.0);
-        // This should trigger jitter_spike since jitter went from 0 to 80
-        // But since stddev might be 0, let's check if we get any anomaly
-        // The rtt_spike should definitely trigger
-        // Test passes if no panic occurs
+        // A large RTT jump fires rtt_spike (and jitter_spike); consume it so
+        // the next sample is judged against the post-spike window
+        let anomalies = detector.on_icmp_ok(30.0);
+        assert!(
+            anomalies.iter().any(|a| a.event_type == "rtt_spike"),
+            "expected rtt_spike, got {anomalies:?}"
+        );
+
+        // Back at the RTT window mean: the RTT itself is unremarkable, but
+        // the jitter delta (|21 - 30| = 9ms against a ~1.5ms jitter baseline)
+        // is a large positive outlier -> jitter_spike
+        let anomalies = detector.on_icmp_ok(21.0);
+        let jitter = anomalies
+            .iter()
+            .find(|a| a.event_type == "jitter_spike")
+            .expect("expected jitter_spike");
+        assert_eq!(jitter.severity, Severity::Warning);
+        assert!(jitter.sigma.unwrap() > 3.0);
+        // The payload is directional: value crossed the upper boundary
+        assert!(jitter.value.unwrap() > jitter.threshold.unwrap());
+    }
+
+    #[test]
+    fn test_anomaly_detector_loss_burst_fires_once_per_burst() {
+        let mut detector = AnomalyDetector::new();
+
+        // Fires exactly at the crossing of 3 consecutive losses...
+        assert!(detector.on_icmp_loss().is_none());
+        assert!(detector.on_icmp_loss().is_none());
+        let event = detector
+            .on_icmp_loss()
+            .expect("loss_burst should fire at the 3rd consecutive loss");
+        assert_eq!(event.value, Some(3.0));
+
+        // ...and does not re-fire for every further consecutive loss, so a
+        // sustained outage cannot flood the event deque or the JSONL log
+        assert!(detector.on_icmp_loss().is_none());
+        assert!(detector.on_icmp_loss().is_none());
+        assert!(detector.on_icmp_loss().is_none());
     }
 
     #[test]

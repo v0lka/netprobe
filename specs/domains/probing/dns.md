@@ -15,19 +15,19 @@ Periodically resolves the target domain with hickory-resolver, measures resoluti
 `DnsProber::new(target, dns_server, timeout)` builds a `Resolver<TokioConnectionProvider>`:
 
 - With `--dns-server <IP>`: `NameServerConfigGroup::from_ips_clear(&[server], 53, true)`, `ResolverConfig::from_parts` — plain UDP DNS to that server only.
-- Without: system resolver config (`ResolverConfig::default()`).
+- Without: the system resolver configuration via `hickory_resolver::system_conf::read_system_conf()` (e.g. `/etc/resolv.conf` on Unix, the registry on Windows) — note `ResolverConfig::default()` is Google Public DNS in hickory 0.25, not the system config.
 - Both: `ResolverOpts { timeout, attempts: 2 }`.
 
 ### Resolution
 
-`DnsProber::resolve() -> DnsResult` wraps `resolver.lookup_ip(target)` in `tokio::time::timeout(timeout_dns_ms)`:
+`DnsProber::resolve() -> DnsResult` wraps `resolver.lookup_ip(target)` in `tokio::time::timeout(timeout_dns_ms * (DNS_ATTEMPTS + 1))` — the resolver's `timeout` is per attempt and `attempts` counts retries, so the whole lookup gets `(attempts + 1) × timeout` before the outer cap fires:
 
 | Outcome | Status | Fields |
 | ------- | ------ | ------ |
-| Lookup success | `Ok` | `resolve_ms` (wall time incl. timeout wrapper), `ips` (all A/AAAA answers), `ttl_secs` (TTL of the first record), `server` (first nameserver from config or `"system"`), `change_info` (see below) |
+| Lookup success | `Ok` | `resolve_ms` (wall time incl. timeout wrapper), `ips` (all A/AAAA answers), `ttl_secs` (TTL of the first record), `server` (first nameserver as `"<ip>:53"` from config, or the literal `"system"` fallback), `change_info` (see below) |
 | Resolver error, `is_nx_domain()` | `Nxdomain` | empty `ips`, `server` |
-| Resolver error containing `SERVFAIL` in debug repr | `Servfail` | empty `ips` |
-| Other resolver error | `Timeout` | empty `ips` |
+| Resolver error with response code `ServFail` (typed check: `ResolveErrorKind::Proto(ProtoErrorKind::NoRecordsFound { response_code: ServFail, .. })` — not a `Debug`-string match) | `Servfail` | empty `ips` |
+| Other resolver error (transport refused/unreachable, malformed reply, …) | `Timeout` | empty `ips` |
 | Outer timeout elapsed | `Timeout` | empty `ips` |
 
 ### Change detection
@@ -59,7 +59,7 @@ Note: the DNS prober resolves the original target hostname throughout the sessio
 
 1. Every DNS attempt produces exactly one `dns` JSONL record.
 2. `dns_change` events fire only from the second successful resolution onward, and only when the IP set (not the order) changed.
-3. Failed resolutions never update `previous_ips`, so a transient failure between two different successful sets still yields a single change event covering both.
+3. Only successful resolutions update `previous_ips`, so a transient failure between two different successful sets still yields a single change event covering both.
 4. The resolver is built once per session; `--dns-server` replaces the entire system config.
 
 ## Related Specs

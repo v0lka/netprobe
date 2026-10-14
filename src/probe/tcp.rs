@@ -14,6 +14,7 @@ use socket2::{Domain, Socket, Type};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
@@ -43,21 +44,42 @@ fn is_connect_in_progress(e: &std::io::Error) -> bool {
     }
 }
 
+/// Map a failed-connect error to the corresponding probe error.
+///
+/// A non-blocking connect reports readiness even when the connection failed
+/// (refused/reset); the outcome is only observable via `SO_ERROR`
+/// (`TcpStream::take_error`), which must be read before declaring success.
+///
+/// Classification is by `io::ErrorKind`, not by the error's `Display` string:
+/// std maps the OS codes (`ECONNREFUSED`/`ECONNRESET` on Unix,
+/// `WSAECONNREFUSED`/`WSAECONNRESET` on Windows) to stable kinds, while the
+/// message text is locale-dependent on Windows.
+fn connect_error_to_probe_error(e: &std::io::Error) -> ProbeError {
+    match e.kind() {
+        std::io::ErrorKind::ConnectionRefused => {
+            ProbeError::Other("Connection refused".to_string())
+        }
+        std::io::ErrorKind::ConnectionReset => ProbeError::Other("Connection reset".to_string()),
+        _ => ProbeError::Timeout,
+    }
+}
+
+/// Map a `writable()` readiness error (already a `ProbeError`) to its status
+fn readiness_error_to_probe_error(e: &ProbeError) -> ProbeError {
+    let error_str = e.to_string().to_lowercase();
+    if error_str.contains("refused") || error_str.contains("connection refused") {
+        ProbeError::Other("Connection refused".to_string())
+    } else if error_str.contains("reset") || error_str.contains("connection reset") {
+        ProbeError::Other("Connection reset".to_string())
+    } else {
+        ProbeError::Timeout
+    }
+}
+
 /// Result of a TCP connection attempt
 #[derive(Debug, Clone)]
 pub struct TcpResult {
     pub connect_ms: f64,
-    #[allow(dead_code)]
-    pub status: LocalTcpStatus,
-}
-
-/// Local TCP connection status (mapped to models::TcpStatus for logging)
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LocalTcpStatus {
-    Connected,
-    Refused,
-    Timeout,
-    Reset,
 }
 
 /// Perform a TCP connection with precise timing
@@ -100,13 +122,7 @@ pub async fn tcp_connect(
                 ProbeError::SocketError(format!("Failed to convert to tokio stream: {}", e))
             })?;
 
-            Ok((
-                tokio_stream,
-                TcpResult {
-                    connect_ms,
-                    status: LocalTcpStatus::Connected,
-                },
-            ))
+            Ok((tokio_stream, TcpResult { connect_ms }))
         }
         Err(e) if is_connect_in_progress(&e) => {
             // Connection in progress - this is expected for non-blocking sockets
@@ -129,38 +145,24 @@ pub async fn tcp_connect(
             .await
             {
                 Ok(Ok(stream)) => {
+                    // For a non-blocking connect, a refused/reset peer still
+                    // makes the socket writable; the real outcome is only
+                    // observable via SO_ERROR (take_error). Only an empty
+                    // SO_ERROR means the connection actually succeeded.
+                    if let Some(e) = stream.take_error().map_err(|e| {
+                        ProbeError::SocketError(format!("Failed to read SO_ERROR: {}", e))
+                    })? {
+                        return Err(connect_error_to_probe_error(&e));
+                    }
+
                     let elapsed = start.elapsed();
                     let connect_ms = elapsed.as_secs_f64() * 1000.0;
 
-                    Ok((
-                        stream,
-                        TcpResult {
-                            connect_ms,
-                            status: LocalTcpStatus::Connected,
-                        },
-                    ))
+                    Ok((stream, TcpResult { connect_ms }))
                 }
                 Ok(Err(e)) => {
                     // Connection failed - determine the error type
-                    let error_str = e.to_string().to_lowercase();
-                    let status = if error_str.contains("refused")
-                        || error_str.contains("connection refused")
-                    {
-                        LocalTcpStatus::Refused
-                    } else if error_str.contains("reset") || error_str.contains("connection reset")
-                    {
-                        LocalTcpStatus::Reset
-                    } else {
-                        LocalTcpStatus::Timeout
-                    };
-
-                    Err(match status {
-                        LocalTcpStatus::Refused => {
-                            ProbeError::Other("Connection refused".to_string())
-                        }
-                        LocalTcpStatus::Reset => ProbeError::Other("Connection reset".to_string()),
-                        _ => ProbeError::Timeout,
-                    })
+                    Err(readiness_error_to_probe_error(&e))
                 }
                 Err(_) => Err(ProbeError::Timeout),
             }
@@ -204,7 +206,13 @@ pub async fn tcp_tls_http_probe_loop(
                 tracing::info!("TCP/TLS/HTTP probe loop cancelled");
                 break;
             }
-            _ = ip_rx.changed() => {
+            res = ip_rx.changed() => {
+                // Closed channel: run_tui (the only sender) is gone — treat
+                // it as shutdown rather than an IP change, so the loop does
+                // not run one more probe on the TUI error-exit path
+                if res.is_err() {
+                    break;
+                }
                 let new_ip = *ip_rx.borrow();
                 tracing::info!("TCP/TLS/HTTP probe updating target to: {}", new_ip);
                 current_target = new_ip;
@@ -228,7 +236,7 @@ pub async fn tcp_tls_http_probe_loop(
         }
 
         match tcp_result {
-            Ok((stream, tcp_data)) => {
+            Ok((mut stream, tcp_data)) => {
                 // TCP succeeded - record it
                 let connect_ms = tcp_data.connect_ms;
 
@@ -263,12 +271,14 @@ pub async fn tcp_tls_http_probe_loop(
                             if let Some(anomaly) =
                                 detector.on_cert_expiry(tls_info.cert_days_remaining)
                             {
-                                let mut store = store.write().await;
-                                store.push_event(
-                                    anomaly.event_type.clone(),
-                                    anomaly.severity.clone(),
-                                    anomaly.message.clone(),
-                                );
+                                {
+                                    let mut store = store.write().await;
+                                    store.push_event(
+                                        anomaly.event_type.clone(),
+                                        anomaly.severity.clone(),
+                                        anomaly.message.clone(),
+                                    );
+                                } // guard dropped before the channel send
                                 let event_record =
                                     detector.to_event_record(&anomaly, &config.target);
                                 let _ = log_tx.send(LogRecord::Event(event_record)).await;
@@ -283,10 +293,6 @@ pub async fn tcp_tls_http_probe_loop(
                                         handshake_ms: tls_info.handshake_ms,
                                         version: tls_info.version.clone(),
                                         cipher: tls_info.cipher.clone(),
-                                        cert_subject: tls_info.cert_subject.clone(),
-                                        cert_issuer: tls_info.cert_issuer.clone(),
-                                        cert_san: tls_info.cert_san.clone(),
-                                        cert_expiry: tls_info.cert_expiry,
                                         cert_days_remaining: tls_info.cert_days_remaining,
                                     }),
                                     None,
@@ -315,103 +321,20 @@ pub async fn tcp_tls_http_probe_loop(
                                 break;
                             }
 
-                            // Step 3: HTTP GET (if not disabled)
+                            // Step 3: HTTP GET over the TLS session (if not
+                            // disabled)
                             if !config.no_http {
                                 let http_timeout = Duration::from_millis(config.timeout_http_ms);
-                                match http_probe(
+                                run_http_stage(
                                     &mut stream,
                                     &hostname,
-                                    &config.http_path,
+                                    &config,
+                                    &store,
+                                    &log_tx,
+                                    &detector,
                                     http_timeout,
                                 )
-                                .await
-                                {
-                                    Ok(http_result) => {
-                                        // Check for HTTP error (status >= 400)
-                                        if http_result.status_code >= 400 {
-                                            let anomaly = detector.on_http_error(
-                                                Some(http_result.status_code),
-                                                &format!("HTTP {}", http_result.status_code),
-                                            );
-                                            let mut store = store.write().await;
-                                            store.push_event(
-                                                anomaly.event_type.clone(),
-                                                anomaly.severity.clone(),
-                                                anomaly.message.clone(),
-                                            );
-                                            let event_record =
-                                                detector.to_event_record(&anomaly, &config.target);
-                                            let _ =
-                                                log_tx.send(LogRecord::Event(event_record)).await;
-                                        }
-
-                                        // Update store with HTTP result
-                                        {
-                                            let mut store = store.write().await;
-                                            store.push_ttfb(http_result.ttfb_ms);
-                                            store.set_latest_http(
-                                                Some(HttpData {
-                                                    ttfb_ms: http_result.ttfb_ms,
-                                                    total_ms: http_result.total_ms,
-                                                    status_code: http_result.status_code,
-                                                }),
-                                                None,
-                                            );
-                                        }
-
-                                        // Send HTTP record
-                                        let http_record = HttpRecord {
-                                            ts: chrono::Utc::now(),
-                                            target: config.target.clone(),
-                                            port: config.port,
-                                            path: config.http_path.clone(),
-                                            ttfb_ms: Some(http_result.ttfb_ms),
-                                            total_ms: Some(http_result.total_ms),
-                                            status_code: Some(http_result.status_code),
-                                            status: if http_result.status_code >= 400 {
-                                                HttpStatus::Error
-                                            } else {
-                                                HttpStatus::Ok
-                                            },
-                                        };
-                                        let _ = log_tx.send(LogRecord::Http(http_record)).await;
-                                    }
-                                    Err(e) => {
-                                        // HTTP probe failed
-                                        let error_msg = e.to_string();
-                                        {
-                                            let mut store = store.write().await;
-                                            store.set_latest_http(None, Some(error_msg.clone()));
-                                        }
-
-                                        // Generate HTTP error event
-                                        let anomaly = detector.on_http_error(None, &error_msg);
-                                        {
-                                            let mut store = store.write().await;
-                                            store.push_event(
-                                                anomaly.event_type.clone(),
-                                                anomaly.severity.clone(),
-                                                anomaly.message.clone(),
-                                            );
-                                        }
-                                        let event_record =
-                                            detector.to_event_record(&anomaly, &config.target);
-                                        let _ = log_tx.send(LogRecord::Event(event_record)).await;
-
-                                        let http_record = HttpRecord {
-                                            ts: chrono::Utc::now(),
-                                            target: config.target.clone(),
-                                            port: config.port,
-                                            path: config.http_path.clone(),
-                                            ttfb_ms: None,
-                                            total_ms: None,
-                                            status_code: None,
-                                            status: HttpStatus::Error,
-                                        };
-                                        let _ = log_tx.send(LogRecord::Http(http_record)).await;
-                                        tracing::warn!("HTTP probe error: {}", e);
-                                    }
-                                }
+                                .await;
                             }
                         }
                         Err(e) => {
@@ -439,6 +362,26 @@ pub async fn tcp_tls_http_probe_loop(
                             let _ = log_tx.send(LogRecord::Tls(tls_record)).await;
                             tracing::warn!("TLS handshake error: {}", e);
                         }
+                    }
+                } else {
+                    // --no-tls: run the HTTP stage over the plain TCP stream.
+                    // The stages are independent (tcp-tls-http.md Invariant 5:
+                    // "With --no-tls, HTTP runs over the plain TCP stream").
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    if !config.no_http {
+                        let http_timeout = Duration::from_millis(config.timeout_http_ms);
+                        run_http_stage(
+                            &mut stream,
+                            &hostname,
+                            &config,
+                            &store,
+                            &log_tx,
+                            &detector,
+                            http_timeout,
+                        )
+                        .await;
                     }
                 }
             }
@@ -487,36 +430,149 @@ pub async fn tcp_tls_http_probe_loop(
     Ok(())
 }
 
+/// Run the HTTP stage of the probe pipeline against whichever stream is
+/// active: the TLS session after a successful handshake, or the plain TCP
+/// stream when TLS is disabled (`--no-tls`).
+///
+/// Emits one HTTP record (plus an `http_error` event and record on failure)
+/// and updates the store's HTTP history/latest slots.
+async fn run_http_stage<S>(
+    stream: &mut S,
+    hostname: &str,
+    config: &Config,
+    store: &SharedStore,
+    log_tx: &mpsc::Sender<LogRecord>,
+    detector: &AnomalyDetector,
+    http_timeout: Duration,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    match http_probe(stream, hostname, &config.http_path, http_timeout).await {
+        Ok(http_result) => {
+            // Check for HTTP error (status >= 400)
+            if http_result.status_code >= 400 {
+                let anomaly = detector.on_http_error(
+                    Some(http_result.status_code),
+                    &format!("HTTP {}", http_result.status_code),
+                );
+                {
+                    let mut store = store.write().await;
+                    store.push_event(
+                        anomaly.event_type.clone(),
+                        anomaly.severity.clone(),
+                        anomaly.message.clone(),
+                    );
+                } // guard dropped before the channel send
+                let event_record = detector.to_event_record(&anomaly, &config.target);
+                let _ = log_tx.send(LogRecord::Event(event_record)).await;
+            }
+
+            // Update store with HTTP result
+            {
+                let mut store = store.write().await;
+                store.push_ttfb(http_result.ttfb_ms);
+                store.set_latest_http(
+                    Some(HttpData {
+                        ttfb_ms: http_result.ttfb_ms,
+                        total_ms: http_result.total_ms,
+                        status_code: http_result.status_code,
+                    }),
+                    None,
+                );
+            }
+
+            // Send HTTP record
+            let http_record = HttpRecord {
+                ts: chrono::Utc::now(),
+                target: config.target.clone(),
+                port: config.port,
+                path: config.http_path.clone(),
+                ttfb_ms: Some(http_result.ttfb_ms),
+                total_ms: Some(http_result.total_ms),
+                status_code: Some(http_result.status_code),
+                status: if http_result.status_code >= 400 {
+                    HttpStatus::Error
+                } else {
+                    HttpStatus::Ok
+                },
+            };
+            let _ = log_tx.send(LogRecord::Http(http_record)).await;
+        }
+        Err(e) => {
+            // HTTP probe failed
+            let error_msg = e.to_string();
+            {
+                let mut store = store.write().await;
+                store.set_latest_http(None, Some(error_msg.clone()));
+            }
+
+            // Generate HTTP error event
+            let anomaly = detector.on_http_error(None, &error_msg);
+            {
+                let mut store = store.write().await;
+                store.push_event(
+                    anomaly.event_type.clone(),
+                    anomaly.severity.clone(),
+                    anomaly.message.clone(),
+                );
+            }
+            let event_record = detector.to_event_record(&anomaly, &config.target);
+            let _ = log_tx.send(LogRecord::Event(event_record)).await;
+
+            let http_record = HttpRecord {
+                ts: chrono::Utc::now(),
+                target: config.target.clone(),
+                port: config.port,
+                path: config.http_path.clone(),
+                ttfb_ms: None,
+                total_ms: None,
+                status_code: None,
+                status: HttpStatus::Error,
+            };
+            let _ = log_tx.send(LogRecord::Http(http_record)).await;
+            tracing::warn!("HTTP probe error: {}", e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[tokio::test]
     async fn test_tcp_connect_refused() {
-        // Connect to a port that's likely not open
-        // Using 127.0.0.1:9 (discard service) which should be refused on most systems
-        // or timeout if no service is running
         let target: IpAddr = "127.0.0.1".parse().unwrap();
-        let result = tcp_connect(target, 9, Duration::from_millis(500)).await;
 
-        // The result could be either an error (refused) or success (if service running)
-        // We just verify the function doesn't panic
+        // Success path: a bound listener must yield a timing result (guards
+        // against the non-blocking connect misreporting a failed connect as
+        // success)
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let open_port = listener.local_addr().unwrap().port();
+        let result = tcp_connect(target, open_port, Duration::from_millis(2000)).await;
         match result {
             Ok((_, tcp_result)) => {
-                // If it succeeded, verify we got a valid result
                 assert!(tcp_result.connect_ms >= 0.0);
-                assert_eq!(tcp_result.status, LocalTcpStatus::Connected);
             }
-            Err(_) => {
-                // Connection failed as expected (refused or timeout)
+            Err(e) => panic!("connect to a bound listener should succeed: {}", e),
+        }
+        drop(listener);
+
+        // Refused path: a freshly released port must produce a refused error
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed_port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let result = tcp_connect(target, closed_port, Duration::from_millis(2000)).await;
+        match result {
+            Ok((_, _)) => panic!("connect to a closed port must not report success"),
+            Err(e) => {
+                let msg = e.to_string().to_lowercase();
+                assert!(
+                    msg.contains("refused"),
+                    "expected a refused error, got: {}",
+                    e
+                );
             }
         }
-    }
-
-    #[test]
-    fn test_tcp_status_enum() {
-        assert_eq!(LocalTcpStatus::Connected, LocalTcpStatus::Connected);
-        assert_ne!(LocalTcpStatus::Connected, LocalTcpStatus::Refused);
-        assert_ne!(LocalTcpStatus::Timeout, LocalTcpStatus::Reset);
     }
 }

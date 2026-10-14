@@ -3,11 +3,11 @@
 //! Defines the vertical stack layout with adaptive proportions based on terminal size.
 //! Proportions (from spec):
 //! - Header: 1 row (fixed)
-//! - Ping panel: ~30%
-//! - DNS panel: ~12%
-//! - TCP/TLS/HTTP panel: ~15%
-//! - Traceroute panel: ~20%
-//! - Events panel: ~18%
+//! - Ping panel: 32%
+//! - DNS panel: 13%
+//! - TCP/TLS/HTTP panel: 16%
+//! - Traceroute panel: 21%
+//! - Events panel: 18%
 //! - Footer: 1 row (fixed)
 //!
 //! Adaptive behavior:
@@ -49,12 +49,9 @@ impl DashboardLayout {
     ///
     /// Returns a vector of constraints for the vertical layout
     fn constraints(&self) -> Vec<Constraint> {
-        let _available_height = self.area.height.saturating_sub(2); // Subtract header and footer
-
         if self.show_traceroute && self.show_events {
             // Full layout with all panels
-            // Proportions: ping 30%, dns 12%, tcp 15%, trace 20%, events 18% = 95%
-            // Remaining 5% distributed
+            // Proportions: ping 32%, dns 13%, tcp 16%, trace 21%, events 18% = 100%
             vec![
                 Constraint::Length(1),      // Header
                 Constraint::Percentage(32), // Ping panel
@@ -127,27 +124,6 @@ impl DashboardLayout {
     }
 }
 
-/// Build layout from area - convenience function
-#[allow(dead_code)]
-pub fn build_layout(area: Rect) -> DashboardLayout {
-    DashboardLayout::new(area)
-}
-
-/// Calculate inner area for a panel (accounting for borders)
-#[allow(dead_code)]
-pub fn inner_area(area: Rect) -> Rect {
-    if area.width >= 2 && area.height >= 2 {
-        Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width - 2,
-            height: area.height - 2,
-        }
-    } else {
-        area
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,33 +174,5 @@ mod tests {
         let layout = DashboardLayout::new(area);
 
         assert!(layout.compact);
-    }
-
-    #[test]
-    fn test_inner_area() {
-        let area = Rect::new(0, 0, 10, 10);
-        let inner = inner_area(area);
-
-        assert_eq!(inner.x, 1);
-        assert_eq!(inner.y, 1);
-        assert_eq!(inner.width, 8);
-        assert_eq!(inner.height, 8);
-    }
-
-    #[test]
-    fn test_inner_area_small() {
-        let area = Rect::new(0, 0, 1, 1);
-        let inner = inner_area(area);
-
-        // Should return same area if too small
-        assert_eq!(inner, area);
-    }
-
-    #[test]
-    fn test_build_layout() {
-        let area = Rect::new(0, 0, 100, 30);
-        let layout = build_layout(area);
-
-        assert_eq!(layout.area, area);
     }
 }

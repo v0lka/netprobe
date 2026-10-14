@@ -1,4 +1,9 @@
 //! Serde models for JSONL records
+//!
+//! Serialization contract for `Option` fields: an absent value causes the
+//! JSON key to be **omitted entirely** (`#[serde(skip_serializing_if)]`),
+//! NOT emitted as `null` — e.g. `rtt_ms` on a timeout, TLS fields on a
+//! handshake failure.
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -208,6 +213,8 @@ pub struct SessionSummary {
     pub uptime_pct: f64,
     pub mos: f64,
     pub grade: char,
+    /// Total events emitted during the session — a monotonic count that is
+    /// NOT capped by the (≤200, FIFO-evicting) events deque length
     pub events_total: u64,
 }
 

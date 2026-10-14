@@ -26,14 +26,16 @@ use crate::tui::{
     tcp_tls_panel::TcpTlsPanel, theme::Theme, trace_panel::TracePanel,
 };
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+    },
 };
 use ratatui::{
     Terminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
 };
 use std::{
     io,
@@ -53,6 +55,21 @@ pub enum FocusPanel {
     Logs,
 }
 
+/// Restores the terminal when dropped, so an early return from
+/// [`TuiApp::run`] (failed setup, panic-hook path) never leaves the shell in
+/// raw mode with the alternate screen still active. The cursor is re-shown
+/// too: ratatui keeps it hidden while drawing, and only the normal exit path
+/// restores it via `Terminal::show_cursor`.
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), crossterm::cursor::Show);
+    }
+}
+
 /// TUI application state
 #[derive(Debug)]
 pub struct TuiApp {
@@ -64,14 +81,14 @@ pub struct TuiApp {
     cancel: CancellationToken,
     /// Notification for forcing traceroute
     trace_notify: std::sync::Arc<Notify>,
+    /// Notification for statistics reset (re-warms the ICMP anomaly detector)
+    reset_notify: std::sync::Arc<Notify>,
     /// Channel for IP address changes
     ip_change_tx: tokio::sync::watch::Sender<std::net::IpAddr>,
     /// Theme
     theme: Theme,
     /// Help popup visible
     show_help: bool,
-    /// Last frame time for FPS calculation
-    last_frame: Instant,
     /// Currently focused panel (for scrolling)
     focused_panel: FocusPanel,
     /// Scroll offset for traceroute panel
@@ -93,6 +110,7 @@ impl TuiApp {
         config: Config,
         cancel: CancellationToken,
         trace_notify: std::sync::Arc<Notify>,
+        reset_notify: std::sync::Arc<Notify>,
         ip_change_tx: tokio::sync::watch::Sender<std::net::IpAddr>,
     ) -> Self {
         Self {
@@ -100,10 +118,10 @@ impl TuiApp {
             config,
             cancel,
             trace_notify,
+            reset_notify,
             ip_change_tx,
             theme: Theme::new(),
             show_help: false,
-            last_frame: Instant::now(),
             focused_panel: FocusPanel::Logs,
             trace_scroll: 0,
             events_scroll: 0,
@@ -117,14 +135,33 @@ impl TuiApp {
     pub async fn run(&mut self) -> anyhow::Result<()> {
         // Setup terminal
         enable_raw_mode()?;
+        // From here on, any early return must still restore the terminal:
+        // the guard covers the fallible setup below (alternate screen,
+        // backend creation) that used to leak raw mode on failure.
+        let terminal_guard = TerminalGuard;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
 
-        // Setup panic hook to restore terminal
+        // Setup panic hook to restore the terminal when the TUI itself
+        // panics. The hook is process-global and the multi-threaded tokio
+        // runtime migrates tasks between worker threads, so thread identity
+        // cannot distinguish "the TUI panicked" from "a probe task panicked
+        // on the same worker"; the panic location can. Only a panic rooted
+        // in `src/tui/` tears down the terminal here — which keeps the panic
+        // message readable — while probe-task panics leave the running
+        // dashboard untouched (their unwind is contained by the task join in
+        // app.rs). Any panic unwinding through `run()` still restores the
+        // terminal via `TerminalGuard`'s drop, including panics surfaced from
+        // dependencies, whose locations this check deliberately ignores.
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+            let from_tui = info
+                .location()
+                .is_some_and(|loc| loc.file().replace('\\', "/").contains("src/tui/"));
+            if from_tui {
+                let _ = disable_raw_mode();
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            }
             original_hook(info);
         }));
 
@@ -132,17 +169,20 @@ impl TuiApp {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
+        // Focus may start on a panel that is hidden at this terminal size
+        self.clamp_focus_to_visible();
+
         // Main loop
         let result = self.run_loop(&mut terminal).await;
 
         // Restore terminal
         disable_raw_mode()?;
-        execute!(
-            terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        )?;
+        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
         terminal.show_cursor()?;
+
+        // The normal path restored the terminal above; defuse the guard so
+        // Drop does not run a second (harmless but noisy) restore.
+        std::mem::forget(terminal_guard);
 
         result
     }
@@ -171,7 +211,6 @@ impl TuiApp {
                     .map_err(|e| anyhow::anyhow!("Terminal draw error: {}", e))?;
                 drop(store); // Explicitly drop the read guard
                 last_draw = now;
-                self.last_frame = now;
             }
 
             // Handle events with timeout
@@ -179,7 +218,7 @@ impl TuiApp {
             if crossterm::event::poll(timeout)?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
-                && self.handle_key(key.code).await?
+                && self.handle_key(key).await?
             {
                 break;
             }
@@ -190,8 +229,15 @@ impl TuiApp {
 
     /// Handle keyboard input
     /// Returns true if the app should exit
-    async fn handle_key(&mut self, key: KeyCode) -> anyhow::Result<bool> {
-        match key {
+    async fn handle_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        match key.code {
+            // Quit (documented Ctrl+C shortcut; raw mode delivers it as a
+            // key event, not as SIGINT)
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel.cancel();
+                return Ok(true);
+            }
+
             // Quit
             KeyCode::Char('q') | KeyCode::Char('Q') => {
                 self.cancel.cancel();
@@ -205,8 +251,13 @@ impl TuiApp {
 
             // Reset statistics
             KeyCode::Char('r') | KeyCode::Char('R') => {
-                let mut store = self.store.write().await;
-                store.reset();
+                {
+                    let mut store = self.store.write().await;
+                    store.reset();
+                }
+                // Tell the ICMP probe loop so its anomaly-detection baseline
+                // re-warms against the fresh statistics
+                self.reset_notify.notify_one();
             }
 
             // Toggle help
@@ -216,47 +267,71 @@ impl TuiApp {
 
             // Scroll up
             KeyCode::Up => match self.focused_panel {
-                FocusPanel::Traceroute => {
-                    if self.trace_scroll > 0 {
-                        self.trace_scroll -= 1;
-                    }
+                FocusPanel::Traceroute if !self.trace_hidden() => {
+                    self.trace_scroll = self.trace_scroll.saturating_sub(1);
                 }
-                FocusPanel::Events => {
-                    self.events_auto_scroll = false;
-                    if self.events_scroll > 0 {
-                        self.events_scroll -= 1;
-                    }
+                FocusPanel::Events if !self.events_hidden() => {
+                    let max_scroll = self.events_max_scroll().await;
+                    let (offset, auto) = Self::apply_scroll_up(
+                        self.events_scroll,
+                        self.events_auto_scroll,
+                        max_scroll,
+                    );
+                    self.events_scroll = offset;
+                    self.events_auto_scroll = auto;
                 }
-                FocusPanel::Logs => {
-                    self.logs_auto_scroll = false;
-                    if self.logs_scroll > 0 {
-                        self.logs_scroll -= 1;
-                    }
+                FocusPanel::Logs if !self.logs_hidden() => {
+                    let max_scroll = self.logs_max_scroll().await;
+                    let (offset, auto) =
+                        Self::apply_scroll_up(self.logs_scroll, self.logs_auto_scroll, max_scroll);
+                    self.logs_scroll = offset;
+                    self.logs_auto_scroll = auto;
                 }
+                // Hidden panels: keys are no-ops instead of mutating
+                // invisible scroll state
+                _ => {}
             },
 
-            // Scroll down
+            // Scroll down (reaching the tail re-enables auto-scroll)
             KeyCode::Down => match self.focused_panel {
-                FocusPanel::Traceroute => {
-                    self.trace_scroll += 1;
+                FocusPanel::Traceroute if !self.trace_hidden() => {
+                    let max_scroll = self.trace_max_scroll().await;
+                    self.trace_scroll = (self.trace_scroll.min(max_scroll) + 1).min(max_scroll);
                 }
-                FocusPanel::Events => {
-                    self.events_auto_scroll = false;
-                    self.events_scroll += 1;
+                FocusPanel::Events if !self.events_hidden() => {
+                    let max_scroll = self.events_max_scroll().await;
+                    let (offset, auto) = Self::apply_scroll_down(
+                        self.events_scroll,
+                        self.events_auto_scroll,
+                        max_scroll,
+                    );
+                    self.events_scroll = offset;
+                    self.events_auto_scroll = auto;
                 }
-                FocusPanel::Logs => {
-                    self.logs_auto_scroll = false;
-                    self.logs_scroll += 1;
+                FocusPanel::Logs if !self.logs_hidden() => {
+                    let max_scroll = self.logs_max_scroll().await;
+                    let (offset, auto) = Self::apply_scroll_down(
+                        self.logs_scroll,
+                        self.logs_auto_scroll,
+                        max_scroll,
+                    );
+                    self.logs_scroll = offset;
+                    self.logs_auto_scroll = auto;
                 }
+                _ => {}
             },
 
-            // Tab to switch focus
+            // Tab to switch focus (cycles visible panels only)
             KeyCode::Tab => {
-                self.focused_panel = match self.focused_panel {
-                    FocusPanel::Traceroute => FocusPanel::Events,
-                    FocusPanel::Events => FocusPanel::Logs,
-                    FocusPanel::Logs => FocusPanel::Traceroute,
-                };
+                let visible = self.visible_panels();
+                if visible.is_empty() {
+                    // Nothing focusable at this terminal size
+                } else if let Some(pos) = visible.iter().position(|p| *p == self.focused_panel) {
+                    self.focused_panel = visible[(pos + 1) % visible.len()];
+                } else {
+                    // Current focus is on a hidden panel: jump to the first visible one
+                    self.focused_panel = visible[0];
+                }
             }
 
             // n/N to switch to next IP address
@@ -298,6 +373,151 @@ impl TuiApp {
         }
 
         Ok(false)
+    }
+
+    /// Scroll one row toward the tail.
+    ///
+    /// Returns the new `(offset, auto_scroll)` pair. Leaving auto-scroll
+    /// anchors the offset at the tail, so the first `Up` moves exactly one
+    /// row back instead of jumping to the top of the buffer; scrolling back
+    /// down to the tail re-enables auto-scroll; the offset never grows past
+    /// the bottom.
+    fn apply_scroll_down(offset: usize, auto_scroll: bool, max_scroll: usize) -> (usize, bool) {
+        if auto_scroll {
+            // Already following the tail: Down there is a no-op and stays in
+            // auto-scroll (there is nothing below the tail)
+            return (max_scroll, true);
+        }
+        let target = offset.min(max_scroll) + 1;
+        if target >= max_scroll {
+            // The tail is reached again: resume following new output
+            (max_scroll, true)
+        } else {
+            (target, false)
+        }
+    }
+
+    /// Scroll one row away from the tail (see [`Self::apply_scroll_down`]).
+    fn apply_scroll_up(offset: usize, auto_scroll: bool, max_scroll: usize) -> (usize, bool) {
+        if auto_scroll {
+            (max_scroll.saturating_sub(1), false)
+        } else {
+            (offset.saturating_sub(1), false)
+        }
+    }
+
+    /// Panels that are currently rendered at this terminal size
+    fn visible_panels(&self) -> Vec<FocusPanel> {
+        match size() {
+            Ok((width, height)) => {
+                let layout = DashboardLayout::new(Rect::new(0, 0, width, height));
+                let mut panels = Vec::with_capacity(3);
+                if layout.is_traceroute_visible() {
+                    panels.push(FocusPanel::Traceroute);
+                }
+                if layout.is_events_visible() {
+                    panels.push(FocusPanel::Events);
+                    panels.push(FocusPanel::Logs);
+                }
+                panels
+            }
+            // Size unknown (e.g. detached terminal): keep every panel usable
+            Err(_) => vec![FocusPanel::Traceroute, FocusPanel::Events, FocusPanel::Logs],
+        }
+    }
+
+    /// Move focus onto a panel that is actually rendered, if any
+    fn clamp_focus_to_visible(&mut self) {
+        let visible = self.visible_panels();
+        if visible.contains(&self.focused_panel) {
+            return;
+        }
+        if let Some(&first) = visible.first() {
+            self.focused_panel = first;
+        }
+    }
+
+    /// True when the events/logs panels are known to be hidden at the
+    /// current terminal size (unknown size → assumed visible)
+    fn events_hidden(&self) -> bool {
+        match size() {
+            Ok((width, height)) => {
+                !DashboardLayout::new(Rect::new(0, 0, width, height)).is_events_visible()
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn logs_hidden(&self) -> bool {
+        self.events_hidden()
+    }
+
+    /// True when the traceroute panel is known to be hidden
+    fn trace_hidden(&self) -> bool {
+        match size() {
+            Ok((width, height)) => {
+                !DashboardLayout::new(Rect::new(0, 0, width, height)).is_traceroute_visible()
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Inner height (content rows) of the events/logs panels, when the
+    /// terminal size is known and the panels are rendered
+    fn events_viewport(&self) -> Option<usize> {
+        let (width, height) = size().ok()?;
+        let layout = DashboardLayout::new(Rect::new(0, 0, width, height));
+        if !layout.is_events_visible() {
+            return None;
+        }
+        let (_, _, _, _, _, events_area, _) = layout.build();
+        Some(events_area.height.saturating_sub(2) as usize) // minus borders
+    }
+
+    fn logs_viewport(&self) -> Option<usize> {
+        self.events_viewport()
+    }
+
+    /// Inner height (content rows) of the traceroute panel
+    fn trace_viewport(&self) -> Option<usize> {
+        let (width, height) = size().ok()?;
+        let layout = DashboardLayout::new(Rect::new(0, 0, width, height));
+        if !layout.is_traceroute_visible() {
+            return None;
+        }
+        let (_, _, _, _, trace_area, _, _) = layout.build();
+        Some(trace_area.height.saturating_sub(2) as usize) // minus borders
+    }
+
+    /// Max scroll offset for the events panel (item count minus viewport)
+    async fn events_max_scroll(&self) -> usize {
+        let store = self.store.read().await;
+        let viewport = self
+            .events_viewport()
+            .unwrap_or_else(|| store.events().len().max(1));
+        store.events().len().saturating_sub(viewport)
+    }
+
+    /// Max scroll offset for the logs panel
+    async fn logs_max_scroll(&self) -> usize {
+        let store = self.store.read().await;
+        let viewport = self
+            .logs_viewport()
+            .unwrap_or_else(|| store.logs().len().max(1));
+        store.logs().len().saturating_sub(viewport)
+    }
+
+    /// Max scroll offset for the traceroute panel (hop count minus viewport)
+    async fn trace_max_scroll(&self) -> usize {
+        let store = self.store.read().await;
+        let hop_count = store
+            .latest_traceroute()
+            .data
+            .as_ref()
+            .map(|d| d.hops.len())
+            .unwrap_or(0);
+        let viewport = self.trace_viewport().unwrap_or(hop_count.max(1));
+        hop_count.saturating_sub(viewport)
     }
 
     /// Draw the UI
@@ -403,12 +623,12 @@ impl TuiApp {
             q           Quit application\n\
             t           Force traceroute (run immediately)\n\
             r           Reset statistics\n\
-            ↑/↓         Scroll events/trace panels\n\
+            n/p         Switch active IP address\n\
+            ↑/↓         Scroll the focused panel (trace/events/logs)\n\
             Tab         Switch focus between panels\n\
             ?           Toggle this help\n\
             Esc         Close help\n\n\
-            Ctrl+C      Quit application\n\n\
-            Press any key to close..."
+            Ctrl+C      Quit application"
             .to_string();
 
         let paragraph = Paragraph::new(help_text)
@@ -436,11 +656,68 @@ pub async fn run_tui(
     config: Config,
     cancel: CancellationToken,
     trace_notify: std::sync::Arc<Notify>,
+    reset_notify: std::sync::Arc<Notify>,
     ip_change_tx: tokio::sync::watch::Sender<std::net::IpAddr>,
 ) -> anyhow::Result<()> {
-    let mut app = TuiApp::new(store, config, cancel, trace_notify, ip_change_tx);
+    // External termination (`kill <pid>`, service managers) must go through
+    // the graceful-shutdown token so the terminal is restored and a final
+    // session_end is written, instead of the default handler killing the
+    // process mid-dashboard. (Ctrl+C inside the terminal arrives as a key
+    // event in raw mode; this covers delivered signals.)
+    spawn_signal_forwarder(cancel.clone());
+
+    let mut app = TuiApp::new(
+        store,
+        config,
+        cancel,
+        trace_notify,
+        reset_notify,
+        ip_change_tx,
+    );
     app.run().await
 }
+
+/// Cancel the shutdown token when a termination signal arrives
+///
+/// The first signal starts the graceful shutdown; a repeat during the
+/// bounded shutdown window force-exits (130 for SIGINT, mirroring the
+/// quiet-mode watchdog in `app.rs`; 143 for SIGTERM). Tokio's signal
+/// handlers stay installed for the process lifetime, so one-shot
+/// listeners would silently swallow the repeat and let a wedged shutdown
+/// hang forever with the dashboard already torn down.
+#[cfg(unix)]
+fn spawn_signal_forwarder(cancel: CancellationToken) {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let cancel_sigterm = cancel.clone();
+    tokio::spawn(async move {
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            sigterm.recv().await;
+            tracing::info!("SIGTERM received; shutting down");
+            cancel_sigterm.cancel();
+            if sigterm.recv().await.is_some() {
+                tracing::info!("second SIGTERM received; forcing exit");
+                std::process::exit(143);
+            }
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Ok(mut sigint) = signal(SignalKind::interrupt()) {
+            sigint.recv().await;
+            tracing::info!("SIGINT received; shutting down");
+            cancel.cancel();
+            if sigint.recv().await.is_some() {
+                tracing::info!("second SIGINT received; forcing exit");
+                std::process::exit(130);
+            }
+        }
+    });
+}
+
+/// No portable signal handling on non-Unix targets
+#[cfg(not(unix))]
+fn spawn_signal_forwarder(_cancel: CancellationToken) {}
 
 #[cfg(test)]
 mod tests {
@@ -493,9 +770,10 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let app = TuiApp::new(store, config, cancel, trace_notify, ip_tx);
+        let app = TuiApp::new(store, config, cancel, trace_notify, reset_notify, ip_tx);
 
         assert!(!app.show_help);
         assert_eq!(app.trace_scroll, 0);
@@ -512,11 +790,22 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let mut app = TuiApp::new(store, config, cancel.clone(), trace_notify, ip_tx);
+        let mut app = TuiApp::new(
+            store,
+            config,
+            cancel.clone(),
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
 
-        let should_exit = app.handle_key(KeyCode::Char('q')).await.unwrap();
+        let should_exit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(should_exit);
         assert!(cancel.is_cancelled());
     }
@@ -527,17 +816,24 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let mut app = TuiApp::new(store, config, cancel, trace_notify, ip_tx);
+        let mut app = TuiApp::new(store, config, cancel, trace_notify, reset_notify, ip_tx);
 
         assert!(!app.show_help);
-        let should_exit = app.handle_key(KeyCode::Char('?')).await.unwrap();
+        let should_exit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(!should_exit);
         assert!(app.show_help);
 
         // Toggle off
-        let should_exit = app.handle_key(KeyCode::Char('?')).await.unwrap();
+        let should_exit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(!should_exit);
         assert!(!app.show_help);
     }
@@ -548,41 +844,148 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let mut app = TuiApp::new(store, config, cancel, trace_notify, ip_tx);
+        let mut app = TuiApp::new(store, config, cancel, trace_notify, reset_notify, ip_tx);
 
         // First enable help
         app.show_help = true;
 
         // Esc should close help
-        let should_exit = app.handle_key(KeyCode::Esc).await.unwrap();
+        let should_exit = app
+            .handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(!should_exit);
         assert!(!app.show_help);
     }
 
     #[tokio::test]
-    async fn test_handle_key_scroll() {
+    async fn test_handle_key_ctrl_c_quits() {
         let store = create_test_store();
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let mut app = TuiApp::new(store, config, cancel, trace_notify, ip_tx);
+        let mut app = TuiApp::new(
+            store,
+            config,
+            cancel.clone(),
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
 
-        // Initial state - focused on Logs
+        // Plain 'c' does NOT quit...
+        let should_exit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!should_exit);
+        assert!(!cancel.is_cancelled());
+
+        // ...but Ctrl+C does (the documented quit shortcut)
+        let should_exit = app
+            .handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+            .await
+            .unwrap();
+        assert!(should_exit);
+        assert!(cancel.is_cancelled());
+    }
+
+    #[test]
+    fn test_apply_scroll_down_anchors_at_tail_and_reenables() {
+        use TuiApp as T;
+
+        // Leaving auto-scroll anchors the offset at the tail; the keypress
+        // that reaches the tail re-enables auto-scroll
+        assert_eq!(T::apply_scroll_down(0, true, 190), (190, true));
+
+        // Manual scrolling walks one row at a time and clamps at the tail
+        assert_eq!(T::apply_scroll_down(5, false, 190), (6, false));
+        assert_eq!(T::apply_scroll_down(189, false, 190), (190, true));
+
+        // Over-scroll is impossible: the offset never passes the bottom
+        assert_eq!(T::apply_scroll_down(500, false, 190), (190, true));
+
+        // Content that fits has no scroll range at all
+        assert_eq!(T::apply_scroll_down(0, true, 0), (0, true));
+    }
+
+    #[test]
+    fn test_apply_scroll_up_seeds_from_tail() {
+        use TuiApp as T;
+
+        // The first Up from auto-scroll lands one row above the tail, not
+        // at the top of the buffer
+        assert_eq!(T::apply_scroll_up(0, true, 190), (189, false));
+
+        // Manual Up keeps walking upward
+        assert_eq!(T::apply_scroll_up(189, false, 190), (188, false));
+
+        // Everything visible: Up simply detaches auto-scroll at offset 0
+        assert_eq!(T::apply_scroll_up(0, true, 0), (0, false));
+    }
+
+    #[tokio::test]
+    async fn test_handle_key_scroll() {
+        let store = create_test_store();
+        {
+            let mut store = store.write().await;
+            for i in 0..5 {
+                store.push_log_event(
+                    if i % 2 == 0 {
+                        tracing::Level::INFO
+                    } else {
+                        tracing::Level::WARN
+                    },
+                    "netprobe::test",
+                    format!("log line {}", i),
+                );
+            }
+        }
+        let config = create_test_config();
+        let cancel = CancellationToken::new();
+        let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
+        let (ip_tx, _ip_rx) = create_test_ip_channel();
+
+        let mut app = TuiApp::new(store, config, cancel, trace_notify, reset_notify, ip_tx);
+
+        // Initial state - focused on Logs, following the tail
         assert_eq!(app.logs_scroll, 0);
         assert!(app.logs_auto_scroll);
 
-        // Scroll down
-        let _ = app.handle_key(KeyCode::Down).await.unwrap();
-        assert_eq!(app.logs_scroll, 1);
-        assert!(!app.logs_auto_scroll); // Auto-scroll disabled
+        // Scroll keys must leave the state consistent. (The terminal size is
+        // not determinable in tests, so the exact offset is
+        // environment-dependent; the invariants are: the offset never passes
+        // the bottom, Up detaches auto-scroll, and re-reaching the tail
+        // re-enables it.)
+        let _ = app
+            .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.logs_scroll <= 5);
+        let _ = app
+            .handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.logs_auto_scroll);
 
-        // Scroll up
-        let _ = app.handle_key(KeyCode::Up).await.unwrap();
-        assert_eq!(app.logs_scroll, 0);
+        // Scrolling back down to the tail resumes auto-scroll
+        for _ in 0..10 {
+            if app.logs_auto_scroll {
+                break;
+            }
+            let _ = app
+                .handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .await
+                .unwrap();
+        }
+        assert!(app.logs_auto_scroll);
     }
 
     #[tokio::test]
@@ -591,23 +994,33 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let mut app = TuiApp::new(store, config, cancel, trace_notify, ip_tx);
+        let mut app = TuiApp::new(store, config, cancel, trace_notify, reset_notify, ip_tx);
 
         // Initial focus is Logs
         assert!(matches!(app.focused_panel, FocusPanel::Logs));
 
         // Tab switches to Traceroute
-        let _ = app.handle_key(KeyCode::Tab).await.unwrap();
+        let _ = app
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(matches!(app.focused_panel, FocusPanel::Traceroute));
 
         // Tab switches to Events
-        let _ = app.handle_key(KeyCode::Tab).await.unwrap();
+        let _ = app
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(matches!(app.focused_panel, FocusPanel::Events));
 
         // Tab switches back to Logs
-        let _ = app.handle_key(KeyCode::Tab).await.unwrap();
+        let _ = app
+            .handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(matches!(app.focused_panel, FocusPanel::Logs));
     }
 
@@ -619,9 +1032,17 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let app = TuiApp::new(shared_store.clone(), config, cancel, trace_notify, ip_tx);
+        let app = TuiApp::new(
+            shared_store.clone(),
+            config,
+            cancel,
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
 
         // Create a test terminal
         let backend = TestBackend::new(120, 40);
@@ -646,9 +1067,17 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let app = TuiApp::new(shared_store.clone(), config, cancel, trace_notify, ip_tx);
+        let app = TuiApp::new(
+            shared_store.clone(),
+            config,
+            cancel,
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
 
         // Create a test terminal
         let backend = TestBackend::new(120, 40);
@@ -672,6 +1101,7 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
         // Populate the store with some data
@@ -683,7 +1113,14 @@ mod tests {
             store.push_tcp_connect(15.3);
         }
 
-        let app = TuiApp::new(shared_store.clone(), config, cancel, trace_notify, ip_tx);
+        let app = TuiApp::new(
+            shared_store.clone(),
+            config,
+            cancel,
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
 
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -705,9 +1142,17 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let mut app = TuiApp::new(shared_store.clone(), config, cancel, trace_notify, ip_tx);
+        let mut app = TuiApp::new(
+            shared_store.clone(),
+            config,
+            cancel,
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
         app.show_help = true;
 
         let backend = TestBackend::new(120, 40);
@@ -730,9 +1175,17 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let app = TuiApp::new(shared_store.clone(), config, cancel, trace_notify, ip_tx);
+        let app = TuiApp::new(
+            shared_store.clone(),
+            config,
+            cancel,
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
 
         // Small terminal triggers compact mode
         let backend = TestBackend::new(60, 20);
@@ -755,9 +1208,17 @@ mod tests {
         let config = create_test_config();
         let cancel = CancellationToken::new();
         let trace_notify = std::sync::Arc::new(Notify::new());
+        let reset_notify = std::sync::Arc::new(Notify::new());
         let (ip_tx, _ip_rx) = create_test_ip_channel();
 
-        let app = TuiApp::new(shared_store.clone(), config, cancel, trace_notify, ip_tx);
+        let app = TuiApp::new(
+            shared_store.clone(),
+            config,
+            cancel,
+            trace_notify,
+            reset_notify,
+            ip_tx,
+        );
 
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();

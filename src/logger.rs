@@ -19,27 +19,16 @@ impl Logger {
     /// Flush interval in seconds
     pub const FLUSH_INTERVAL_SECS: u64 = 5;
 
-    /// Create a new logger and mpsc channel
+    /// Create a new logger and its mpsc channel
     ///
-    /// Returns the Logger (which should be passed to run()) and the Sender
-    pub async fn new(path: &Path) -> Result<(Self, mpsc::Sender<LogRecord>)> {
-        // Create/truncate the file
-        let file = File::create(path).await?;
-        let writer = BufWriter::new(file);
-
-        let logger = Self { writer };
-        let (tx, _rx) = mpsc::channel(Self::CHANNEL_BUFFER_SIZE);
-
-        Ok((logger, tx))
-    }
-
-    /// Create a new logger with an existing sender
-    ///
-    /// This is useful for testing when you want to create your own channel
-    #[allow(dead_code)]
-    pub async fn new_with_sender(
+    /// Returns the Logger (pass it to [`Self::run`]), the Sender that record
+    /// producers send on, and the Receiver that `run` drains. The channel
+    /// closes — and the logger drains and flushes — once every Sender clone
+    /// is dropped.
+    pub async fn new(
         path: &Path,
     ) -> Result<(Self, mpsc::Sender<LogRecord>, mpsc::Receiver<LogRecord>)> {
+        // Create/truncate the file
         let file = File::create(path).await?;
         let writer = BufWriter::new(file);
 
@@ -56,7 +45,9 @@ impl Logger {
     /// - Serialize them to JSON
     /// - Write to the file with newline
     /// - Flush every 5 seconds or immediately for events
-    /// - Stop when cancellation token is triggered
+    /// - Stop when the channel closes: after a cancellation trigger it
+    ///   performs one flush, then keeps draining so no buffered record is
+    ///   lost before the final flush-and-exit
     pub async fn run(
         mut self,
         mut rx: mpsc::Receiver<LogRecord>,
@@ -119,13 +110,6 @@ impl Logger {
 
         Ok(())
     }
-
-    /// Flush the writer explicitly
-    #[allow(dead_code)]
-    pub async fn flush(&mut self) -> Result<()> {
-        self.writer.flush().await?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -142,7 +126,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_path = temp_dir.path().join("test.jsonl");
 
-        let (logger, tx, rx) = Logger::new_with_sender(&log_path).await.unwrap();
+        let (logger, tx, rx) = Logger::new(&log_path).await.unwrap();
         let cancel = CancellationToken::new();
 
         // Spawn logger task
@@ -210,7 +194,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_path = temp_dir.path().join("test.jsonl");
 
-        let (logger, tx, rx) = Logger::new_with_sender(&log_path).await.unwrap();
+        let (logger, tx, rx) = Logger::new(&log_path).await.unwrap();
         let cancel = CancellationToken::new();
 
         // Spawn logger task
@@ -252,7 +236,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_path = temp_dir.path().join("test.jsonl");
 
-        let (logger, tx, rx) = Logger::new_with_sender(&log_path).await.unwrap();
+        let (logger, tx, rx) = Logger::new(&log_path).await.unwrap();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
 
@@ -328,7 +312,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let log_path = temp_dir.path().join("test.jsonl");
 
-        let (logger, tx, rx) = Logger::new_with_sender(&log_path).await.unwrap();
+        let (logger, tx, rx) = Logger::new(&log_path).await.unwrap();
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
 

@@ -22,7 +22,7 @@ Commands (mirroring `.github/workflows/ci.yml`; CI runs them on Linux, macOS, Wi
 cargo fmt -- --check          # formatting gate
 cargo clippy -- -D warnings   # lint gate (warnings are errors)
 cargo build --release         # build
-cargo test                    # unit tests (~300 across modules)
+cargo test                    # unit tests (~180 across modules) + the tests/cli.rs integration test
 ```
 
 Manual smoke test (needs elevated privileges for traceroute on Linux/macOS):
@@ -40,7 +40,7 @@ Windows: traceroute works without elevation (`tracert.exe`); ICMP uses the subpr
 ## 3. Getting Started: Navigation
 
 1. Open [INDEX.md](INDEX.md) → find your task in the Task → Spec table.
-2. Start at the domain `README.md` (Purpose / Key Files / Core Types / Flow / Invariants / Extension Points).
+2. Start at the domain `README.md` (Purpose / Key Files / Core Types / Flow / Invariants / Configuration / Extension Points / Related Specs).
 3. Drill into the detail file for the component you touch; check the contract if you cross a boundary.
 
 ---

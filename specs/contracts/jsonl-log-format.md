@@ -13,17 +13,19 @@ This is the **external** interface between netprobe and log consumers (scripts, 
 
 ## Initialization
 
-The file is created/truncated at startup (`Logger::new`); the first line is always `session_start`. Default location: `./netprobe-<target>-<unix-secs>.jsonl`, overridable via `--log`.
+The file is created/truncated at startup (`Logger::new`); the first line is always `session_start`. Default location: `./netprobe-<sanitized-target>-<unix-secs>.jsonl` (target characters outside `[A-Za-z0-9._-]` replaced with `_`, as described in [cli-to-app.md](cli-to-app.md)), overridable via `--log`.
 
 ## Record Schemas
 
 Discriminant values (`"type"`): `icmp`, `dns`, `tcp`, `tls`, `http`, `traceroute`, `event`, `session_start`, `session_end`.
 
+**Optional fields:** every `| null` type below is an `Option` in `models.rs` with `#[serde(skip_serializing_if = "Option::is_none")]` — when absent, the **key is omitted entirely** (never emitted as JSON `null`). "X \| null" reads as "X, or the key is not present".
+
 **icmp**
 | Field | Type | Notes |
 | ----- | ---- | ----- |
 | `seq` | u16 | probe sequence |
-| `rtt_ms` | f64 \| null | `null` on timeout/error |
+| `rtt_ms` | f64 \| null | key omitted on timeout/error |
 | `ttl` | u8 \| null | IPv4 replies only |
 | `status` | `ok` \| `timeout` \| `error` | |
 
@@ -34,16 +36,16 @@ Discriminant values (`"type"`): `icmp`, `dns`, `tcp`, `tls`, `http`, `traceroute
 | `port` u16 · `connect_ms` f64 \| null | `status`: `ok` \| `refused` \| `timeout` \| `reset` |
 
 **tls**
-| `port` u16 · `handshake_ms` f64 \| null · `version` string \| null (e.g. `TLSv1.3`) · `cipher` string \| null · `cert_subject` string \| null · `cert_issuer` string \| null · `cert_san` [string] \| null · `cert_expiry` RFC 3339 \| null · `cert_days_remaining` i64 \| null | `status`: `ok` \| `error` — all metric fields `null` on error |
+| `port` u16 · `handshake_ms` f64 \| null · `version` string \| null (e.g. `TLSv1.3`) · `cipher` string \| null · `cert_subject` string \| null · `cert_issuer` string \| null · `cert_san` [string] \| null · `cert_expiry` RFC 3339 \| null · `cert_days_remaining` i64 \| null | `status`: `ok` \| `error` — all metric keys omitted on error |
 
 **http**
 | `port` u16 · `path` string · `ttfb_ms` f64 \| null · `total_ms` f64 \| null · `status_code` u16 \| null | `status`: `ok` \| `error` (`error` also for status ≥ 400) |
 
 **traceroute**
-| `hops` [{ `hop` u8 · `ip` string \| null · `rtt_ms` f64 \| null · `host` string \| null }] · `hop_count` u8 | `status`: `ok` \| `error` — exactly one record per trace attempt; error attempts carry `status: error` with empty `hops` (see [../domains/probing/traceroute.md](../domains/probing/traceroute.md)) |
+| `hops` [{ `hop` u8 · `ip` string \| null · `rtt_ms` f64 \| null · `host` string \| null }] · `hop_count` u8 — `hop_count` is the number of entries in `hops` (not the highest hop number) | `status`: `ok` \| `error` — exactly one record per trace attempt; error attempts carry `status: error` with empty `hops` and `hop_count: 0` (see [../domains/probing/traceroute.md](../domains/probing/traceroute.md)) |
 
 **event**
-| `event` string (see [../domains/anomaly-detection.md](../domains/anomaly-detection.md) for the catalog) · `severity` `info` \| `warning` \| `critical` · `value` f64 \| null · `threshold` f64 \| null · `sigma` f64 \| null · `message` string | emitted for: `rtt_spike`, `jitter_spike`, `loss_burst`, `dns_change`, `cert_expiry_warning`, `http_error`, `tcp_refused` |
+| `event` string (catalog owned by [../domains/anomaly-detection.md](../domains/anomaly-detection.md) — its Detectors table is the authoritative, exhaustive list of `event` discriminants) · `severity` `info` \| `warning` \| `critical` · `value` f64 \| null · `threshold` f64 \| null · `sigma` f64 \| null · `message` string | the `event` discriminant set is defined once, in the anomaly-detection catalog (includes the traceroute-derived `route_change` and `hop_rtt_anomaly`); this contract intentionally does not re-list it |
 
 **session_start**
 | `resolved_target` string \| null · `traceroute_available` bool · `config` { `port` u16 · `interval_icmp_ms` u64 · `interval_dns_sec` u64 · `interval_tcp_sec` u64 · `interval_trace_sec` u64 · `history_size` usize · `icmp_strategy` string (`unprivileged` \| `raw` \| `subprocess`) } | exactly the first record |

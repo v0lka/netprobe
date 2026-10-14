@@ -8,12 +8,20 @@ use anyhow::Result;
 use hickory_resolver::Resolver;
 use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
 use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::proto::ProtoErrorKind;
+use hickory_resolver::proto::op::ResponseCode;
+use hickory_resolver::{ResolveError, ResolveErrorKind};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{Instant, interval};
 use tokio_util::sync::CancellationToken;
+
+/// DNS retry count for the resolver (`attempts` are retries after a timeout,
+/// so a lookup can legitimately run up to `DNS_ATTEMPTS + 1` per-request
+/// timeouts before giving up).
+const DNS_ATTEMPTS: usize = 2;
 
 /// Type alias for TokioResolver (hickory-resolver 0.25+)
 pub type TokioResolver = Resolver<TokioConnectionProvider>;
@@ -25,6 +33,25 @@ pub struct DnsChangeInfo {
     pub new_ips: HashSet<IpAddr>,
 }
 
+/// Detect a change in the resolved IP set
+///
+/// Returns `None` for the first resolution (nothing to compare against) and
+/// whenever the resolved set is unchanged; otherwise describes the old and
+/// new sets.
+fn detect_dns_change(
+    previous_ips: &HashSet<IpAddr>,
+    current_ips: &HashSet<IpAddr>,
+) -> Option<DnsChangeInfo> {
+    if !previous_ips.is_empty() && previous_ips != current_ips {
+        Some(DnsChangeInfo {
+            old_ips: previous_ips.clone(),
+            new_ips: current_ips.clone(),
+        })
+    } else {
+        None
+    }
+}
+
 /// Result of a DNS resolution
 #[derive(Debug, Clone)]
 pub struct DnsResult {
@@ -34,6 +61,26 @@ pub struct DnsResult {
     pub server: String,
     pub status: DnsStatus,
     pub change_info: Option<DnsChangeInfo>,
+}
+
+/// Classify a resolver error as SERVFAIL by its typed response code.
+///
+/// hickory surfaces a SERVFAIL response as a `Proto` error wrapping
+/// `ProtoErrorKind::NoRecordsFound` carrying the server's `ResponseCode`;
+/// matching on the discriminant (rather than the error's `Debug` string)
+/// keeps the classification stable across hickory releases.
+fn is_servfail(e: &ResolveError) -> bool {
+    matches!(
+        e.kind(),
+        ResolveErrorKind::Proto(proto_err)
+            if matches!(
+                proto_err.kind(),
+                ProtoErrorKind::NoRecordsFound {
+                    response_code: ResponseCode::ServFail,
+                    ..
+                }
+            )
+    )
 }
 
 /// DNS Prober
@@ -58,14 +105,19 @@ impl DnsProber {
             let config = ResolverConfig::from_parts(None, vec![], name_servers);
             let mut opts = ResolverOpts::default();
             opts.timeout = timeout;
-            opts.attempts = 2;
+            opts.attempts = DNS_ATTEMPTS;
             (config, opts)
         } else {
-            // Use system configuration with custom options
-            let mut opts = ResolverOpts::default();
+            // Use the system resolver configuration (e.g. /etc/resolv.conf on
+            // Unix, the registry on Windows). `ResolverConfig::default()` is
+            // Google Public DNS in hickory 0.25, not the system config.
+            let (config, mut opts) =
+                hickory_resolver::system_conf::read_system_conf().map_err(|e| {
+                    ProbeError::Other(format!("Failed to read system DNS configuration: {}", e))
+                })?;
             opts.timeout = timeout;
-            opts.attempts = 2;
-            (ResolverConfig::default(), opts)
+            opts.attempts = DNS_ATTEMPTS;
+            (config, opts)
         };
 
         let resolver =
@@ -85,9 +137,15 @@ impl DnsProber {
     pub async fn resolve(&mut self) -> DnsResult {
         let start = Instant::now();
 
-        // Perform the lookup with timeout
-        let lookup_result =
-            tokio::time::timeout(self.timeout, self.resolver.lookup_ip(&self.target)).await;
+        // Perform the lookup with an overall cap sized to admit the retries:
+        // the resolver's `timeout` is per attempt and `attempts` counts
+        // retries, so the whole lookup can legitimately take up to
+        // (attempts + 1) × timeout before it must give up.
+        let lookup_result = tokio::time::timeout(
+            self.timeout * (DNS_ATTEMPTS as u32 + 1),
+            self.resolver.lookup_ip(&self.target),
+        )
+        .await;
 
         let elapsed = start.elapsed();
         let resolve_ms = elapsed.as_secs_f64() * 1000.0;
@@ -105,15 +163,7 @@ impl DnsProber {
                 let server = self.get_dns_server_string();
 
                 // Detect changes
-                let change_info =
-                    if !self.previous_ips.is_empty() && self.previous_ips != current_ips {
-                        Some(DnsChangeInfo {
-                            old_ips: self.previous_ips.clone(),
-                            new_ips: current_ips.clone(),
-                        })
-                    } else {
-                        None
-                    };
+                let change_info = detect_dns_change(&self.previous_ips, &current_ips);
 
                 // Update previous IPs
                 self.previous_ips = current_ips;
@@ -128,17 +178,13 @@ impl DnsProber {
                 }
             }
             Ok(Err(e)) => {
-                // DNS error (NXDOMAIN, SERVFAIL, etc.)
+                // DNS error (NXDOMAIN, SERVFAIL, transport failures, ...)
                 let status = if e.is_nx_domain() {
                     DnsStatus::Nxdomain
+                } else if is_servfail(&e) {
+                    DnsStatus::Servfail
                 } else {
-                    // Check for SERVFAIL by examining the error kind
-                    let error_str = format!("{:?}", e);
-                    if error_str.contains("SERVFAIL") {
-                        DnsStatus::Servfail
-                    } else {
-                        DnsStatus::Timeout
-                    }
+                    DnsStatus::Timeout
                 };
 
                 DnsResult {
@@ -174,18 +220,6 @@ impl DnsProber {
             .map(|ns| ns.socket_addr.to_string())
             .unwrap_or_else(|| "system".to_string())
     }
-
-    /// Get a reference to the resolver (for testing)
-    #[allow(dead_code)]
-    fn resolver(&self) -> &TokioResolver {
-        &self.resolver
-    }
-
-    /// Get the target
-    #[allow(dead_code)]
-    pub fn target(&self) -> &str {
-        &self.target
-    }
 }
 
 /// Main DNS probe loop
@@ -200,11 +234,10 @@ pub async fn dns_probe_loop(
     let mut ticker = interval(Duration::from_secs(interval_sec));
     let detector = AnomalyDetector::new();
 
-    // Perform initial DNS resolution immediately (check cancellation first)
-    if !cancel.is_cancelled() {
-        let initial_result = prober.resolve().await;
-        process_dns_result(&initial_result, &store, &log_tx, &target, &detector).await;
-    }
+    // Note: `tokio::time::interval`'s first tick completes immediately, so the
+    // loop below performs exactly one resolution right away, then ticks —
+    // no separate pre-loop resolve is needed (that used to emit two
+    // back-to-back records at startup).
 
     loop {
         // Wait for next tick or cancellation (biased to prioritize cancellation)
@@ -314,49 +347,25 @@ mod tests {
 
     #[test]
     fn test_dns_change_detection() {
-        // Simulate two consecutive DNS resolutions with different IPs
+        // Drive the same predicate the prober uses (detect_dns_change)
         let ip1: IpAddr = "1.1.1.1".parse().unwrap();
         let ip2: IpAddr = "1.0.0.1".parse().unwrap();
         let ip3: IpAddr = "8.8.8.8".parse().unwrap();
 
         // First resolution - no previous IPs, so no change
-        let mut previous_ips: HashSet<IpAddr> = HashSet::new();
+        let previous_ips: HashSet<IpAddr> = HashSet::new();
         let current_ips_1: HashSet<IpAddr> = [ip1, ip2].iter().cloned().collect();
 
-        let change_info_1 = if !previous_ips.is_empty() && previous_ips != current_ips_1 {
-            Some(DnsChangeInfo {
-                old_ips: previous_ips.clone(),
-                new_ips: current_ips_1.clone(),
-            })
-        } else {
-            None
-        };
-
         assert!(
-            change_info_1.is_none(),
+            detect_dns_change(&previous_ips, &current_ips_1).is_none(),
             "First resolution should not trigger change"
         );
-
-        // Update previous IPs
-        previous_ips = current_ips_1;
 
         // Second resolution - different IPs, should trigger change
         let current_ips_2: HashSet<IpAddr> = [ip1, ip3].iter().cloned().collect();
 
-        let change_info_2 = if !previous_ips.is_empty() && previous_ips != current_ips_2 {
-            Some(DnsChangeInfo {
-                old_ips: previous_ips.clone(),
-                new_ips: current_ips_2.clone(),
-            })
-        } else {
-            None
-        };
-
-        assert!(
-            change_info_2.is_some(),
-            "Second resolution should trigger change"
-        );
-        let change = change_info_2.unwrap();
+        let change = detect_dns_change(&current_ips_1, &current_ips_2)
+            .expect("Second resolution should trigger change");
         assert!(
             change.old_ips.contains(&ip2),
             "Old IPs should contain 1.0.0.1"
@@ -371,20 +380,8 @@ mod tests {
         );
 
         // Third resolution - same IPs, no change
-        previous_ips = current_ips_2;
-        let current_ips_3: HashSet<IpAddr> = [ip1, ip3].iter().cloned().collect();
-
-        let change_info_3 = if !previous_ips.is_empty() && previous_ips != current_ips_3 {
-            Some(DnsChangeInfo {
-                old_ips: previous_ips.clone(),
-                new_ips: current_ips_3.clone(),
-            })
-        } else {
-            None
-        };
-
         assert!(
-            change_info_3.is_none(),
+            detect_dns_change(&current_ips_2, &current_ips_2).is_none(),
             "Third resolution should not trigger change (same IPs)"
         );
     }

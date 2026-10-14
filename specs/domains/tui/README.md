@@ -9,7 +9,7 @@ Interactive terminal dashboard (ratatui + crossterm) that renders live session s
 - `src/tui/mod.rs` — `run_tui` entry, `TuiApp` state, event loop, key handling, help popup, panic-hook terminal restore
 - `src/tui/layout.rs` — `DashboardLayout` (adaptive vertical stack, compact mode)
 - `src/tui/theme.rs` — `Theme` color palette and severity styles
-- `src/tui/header.rs`, `ping_panel.rs`, `dns_panel.rs`, `tcp_tls_panel.rs`, `trace_panel.rs`, `events_panel.rs`, `logs_panel.rs`, `footer.rs` — panel widgets
+- `src/tui/header.rs`, `src/tui/ping_panel.rs`, `src/tui/dns_panel.rs`, `src/tui/tcp_tls_panel.rs`, `src/tui/trace_panel.rs`, `src/tui/events_panel.rs`, `src/tui/logs_panel.rs`, `src/tui/footer.rs` — panel widgets
 - `src/tui/sparkline.rs` — `BrailleSparkline` widget (see [sparkline.md](sparkline.md))
 - `src/tui_tracing.rs` — `TuiTracingLayer`/`TracingLogReceiver` bridging `tracing` into the store logs deque
 
@@ -24,7 +24,9 @@ pub struct TuiApp {
     config: Config,
     cancel: CancellationToken,                    // cancels on q / Ctrl+C
     trace_notify: Arc<Notify>,                    // t hotkey → traceroute force signal
+    reset_notify: Arc<Notify>,                    // r hotkey → statistics-reset signal
     ip_change_tx: watch::Sender<IpAddr>,          // n/p hotkeys → probe retarget
+    theme: Theme,
     show_help: bool,
     focused_panel: FocusPanel,
     trace_scroll: usize,
@@ -36,9 +38,11 @@ pub struct TuiApp {
 ## Flow
 
 ```
-run_tui(store, config, cancel, trace_notify, ip_change_tx)
-  ├─ enable_raw_mode + EnterAlternateScreen + EnableMouseCapture
-  ├─ install panic hook (restore terminal, then delegate to previous hook)
+run_tui(store, config, cancel, trace_notify, reset_notify, ip_change_tx)
+  ├─ spawn signal forwarders (Unix: delivered SIGINT/SIGTERM → cancel;
+  │    a repeat during shutdown force-exits 130/143)
+  ├─ enable_raw_mode + EnterAlternateScreen
+  ├─ install panic hook (restore terminal for panics under src/tui/, then delegate to previous hook)
   ├─ loop {                                    // draw_interval = 250 ms
   │    cancel.is_cancelled()? → break
   │    if 250 ms elapsed:
@@ -57,7 +61,7 @@ run_tui(store, config, cancel, trace_notify, ip_change_tx)
 | --- | ------ |
 | `q` / `Q` / Ctrl+C | graceful shutdown (cancels token; `session_end` written by app) |
 | `t` / `T` | notify `trace_notify` (force traceroute signal) |
-| `r` / `R` | `store.reset()` — clear histories + aggregates, new sub-session |
+| `r` / `R` | `store.reset()` under a write lock — clear histories + aggregates, new sub-session — then `reset_notify.notify_one()` so the ICMP probe loop re-creates its anomaly detector (the other loops' detectors are stateless and need no re-warm) |
 | `?` | toggle help popup; `Esc` closes it |
 | `↑` / `↓` | scroll the focused panel (traceroute, events, or logs) |
 | `Tab` | cycle focus Traceroute → Events → Logs (scrolls disable auto-scroll) |
@@ -68,16 +72,16 @@ Only `KeyEventKind::Press` is handled (safe for Windows key-repeat events).
 
 ## Invariants
 
-1. The TUI consumes the store read-only: no panel or key handler writes metrics; the only outward signals are the cancel token, `trace_notify`, and `ip_change_tx`.
+1. The TUI reads the store per frame; the only store writes are the sanctioned `r` reset and the n/p IP-cycle accessors (`next_ip`/`prev_ip`), each executed under a write lock. The only outward signals are the cancel token, `trace_notify`, `reset_notify`, and `ip_change_tx`.
 2. Exactly one store read lock is held per frame and dropped before polling input.
-3. Terminal state (raw mode, alternate screen, cursor) is restored on every exit path, including panics (hook) — quiet mode never touches the terminal.
-4. The dashboard renders only what is in the store; panels never call probers or I/O.
+3. Terminal state (raw mode, alternate screen, cursor) is restored on every exit path, including panics (hook); quiet mode runs with no terminal setup at all.
+4. The dashboard renders only what is in the store; the only outward control signals are the notify/watch/cancel handles — probers and I/O stay out of the panels.
 5. Draw cadence is 250 ms regardless of probe rates.
 
 ## Configuration
 
 - Draw interval: 250 ms (constant `draw_interval` in `run_loop`).
-- Layout thresholds: height ≥ 24 rows and width ≥ 80 columns for the full layout — see [panels-and-layout.md](panels-and-layout.md).
+- Layout thresholds: height ≥ 24 rows selects the full panel set (below it, the traceroute/events panels drop out); width ≥ 80 columns only switches off compact value formatting — the panel set is unchanged by width (see [panels-and-layout.md](panels-and-layout.md)).
 - Quiet mode (`-q`) skips the TUI entirely (no terminal setup, plain stderr tracing).
 
 ## Extension Points

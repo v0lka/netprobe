@@ -19,3 +19,7 @@ Positive and negative impacts on the codebase.
 ## Alternatives Considered
 
 What was evaluated and why it was rejected.
+
+## Related Specs
+
+Links to the specs affected by or related to this decision.
