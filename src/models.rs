@@ -229,7 +229,6 @@ pub enum LogRecord {
     Tcp(TcpRecord),
     Tls(TlsRecord),
     Http(HttpRecord),
-    #[allow(dead_code)]
     Traceroute(TracerouteRecord),
     Event(EventRecord),
     SessionStart(SessionStartRecord),

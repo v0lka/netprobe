@@ -113,8 +113,7 @@ pub async fn run(config: Config, tracing_receiver: Option<TracingLogReceiver>) -
         },
     };
 
-    let log_sender_clone = log_sender.clone();
-    log_sender_clone
+    log_sender
         .send(LogRecord::SessionStart(session_start))
         .await
         .context("Failed to send session_start record")?;

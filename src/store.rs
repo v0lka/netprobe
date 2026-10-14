@@ -836,6 +836,10 @@ mod tests {
         store.push_dns_resolve(5.0);
         store.inc_icmp_sent();
 
+        // Small delay so the reset timestamp is strictly newer than the
+        // original one (Utc::now() can return the same value within one tick)
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
         // Reset
         store.reset();
 

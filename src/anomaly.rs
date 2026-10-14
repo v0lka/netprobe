@@ -295,7 +295,6 @@ impl AnomalyDetector {
     }
 
     /// Process route change
-    #[allow(dead_code)]
     pub fn on_route_change(&self, description: &str) -> AnomalyEvent {
         AnomalyEvent {
             event_type: "route_change".to_string(),
@@ -308,7 +307,6 @@ impl AnomalyDetector {
     }
 
     /// Process hop RTT anomaly
-    #[allow(dead_code)]
     pub fn on_hop_rtt_anomaly(
         &self,
         hop: u8,
