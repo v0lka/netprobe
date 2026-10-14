@@ -557,7 +557,16 @@ mod tests {
         }
         drop(listener);
 
-        // Refused path: a freshly released port must produce a refused error
+        // Refused path: a freshly released port must produce a refusal-family
+        // error — never a success and never a socket-level failure.
+        //
+        // On Windows runners a SYN to a just-closed loopback port can be
+        // dropped instead of answered with RST and surfaces as WSAETIMEDOUT,
+        // which `connect_error_to_probe_error` maps to `ProbeError::Timeout`,
+        // so there a timeout-family result is accepted too. On Unix a closed
+        // loopback port reliably answers ECONNREFUSED and refusal is asserted
+        // strictly. Matching is on the error variant, not its Display string,
+        // mirroring the kind-based classification of the production code.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let closed_port = listener.local_addr().unwrap().port();
         drop(listener);
@@ -565,14 +574,17 @@ mod tests {
         let result = tcp_connect(target, closed_port, Duration::from_millis(2000)).await;
         match result {
             Ok((_, _)) => panic!("connect to a closed port must not report success"),
-            Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                assert!(
-                    msg.contains("refused"),
-                    "expected a refused error, got: {}",
-                    e
-                );
-            }
+            Err(ProbeError::Other(msg)) if msg.contains("refused") => {}
+            Err(ProbeError::Timeout) if cfg!(windows) => {}
+            Err(other) => panic!(
+                "expected a refused error{}, got: {}",
+                if cfg!(windows) {
+                    " (or a Windows loopback timeout)"
+                } else {
+                    ""
+                },
+                other
+            ),
         }
     }
 }
