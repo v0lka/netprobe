@@ -12,10 +12,10 @@ Periodically resolves the target domain with hickory-resolver, measures resoluti
 
 ### Resolver setup
 
-`DnsProber::new(target, dns_server, timeout)` builds a `Resolver<TokioConnectionProvider>`:
+`DnsProber::new(target, dns_server, timeout)` builds a `TokioResolver` (= `Resolver<TokioRuntimeProvider>`, hickory-resolver 0.26):
 
-- With `--dns-server <IP>`: `NameServerConfigGroup::from_ips_clear(&[server], 53, true)`, `ResolverConfig::from_parts` — plain UDP DNS to that server only.
-- Without: the system resolver configuration via `hickory_resolver::system_conf::read_system_conf()` (e.g. `/etc/resolv.conf` on Unix, the registry on Windows) — note `ResolverConfig::default()` is Google Public DNS in hickory 0.25, not the system config.
+- With `--dns-server <IP>`: `vec![NameServerConfig::udp_and_tcp(server)]`, `ResolverConfig::from_parts` — plain UDP DNS to that server only.
+- Without: the system resolver configuration via `hickory_resolver::system_conf::read_system_conf()` (e.g. `/etc/resolv.conf` on Unix, the registry on Windows) — note `ResolverConfig::default()` is Google Public DNS in hickory 0.25/0.26, not the system config.
 - Both: `ResolverOpts { timeout, attempts: 2 }`.
 
 ### Resolution
@@ -26,7 +26,7 @@ Periodically resolves the target domain with hickory-resolver, measures resoluti
 | ------- | ------ | ------ |
 | Lookup success | `Ok` | `resolve_ms` (wall time incl. timeout wrapper), `ips` (all A/AAAA answers), `ttl_secs` (TTL of the first record), `server` (first nameserver as `"<ip>:53"` from config, or the literal `"system"` fallback), `change_info` (see below) |
 | Resolver error, `is_nx_domain()` | `Nxdomain` | empty `ips`, `server` |
-| Resolver error with response code `ServFail` (typed check: `ResolveErrorKind::Proto(ProtoErrorKind::NoRecordsFound { response_code: ServFail, .. })` — not a `Debug`-string match) | `Servfail` | empty `ips` |
+| Resolver error with response code `ServFail` (typed check: `NetError::Dns(DnsError::ResponseCode(ServFail))` — not a `Debug`-string match) | `Servfail` | empty `ips` |
 | Other resolver error (transport refused/unreachable, malformed reply, …) | `Timeout` | empty `ips` |
 | Outer timeout elapsed | `Timeout` | empty `ips` |
 

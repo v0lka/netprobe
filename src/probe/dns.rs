@@ -5,12 +5,11 @@ use crate::models::{DnsRecord, DnsStatus, LogRecord};
 use crate::probe::ProbeError;
 use crate::store::{DnsData, SharedStore};
 use anyhow::Result;
-use hickory_resolver::Resolver;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::proto::ProtoErrorKind;
+pub use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::proto::op::ResponseCode;
-use hickory_resolver::{ResolveError, ResolveErrorKind};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -22,9 +21,6 @@ use tokio_util::sync::CancellationToken;
 /// so a lookup can legitimately run up to `DNS_ATTEMPTS + 1` per-request
 /// timeouts before giving up).
 const DNS_ATTEMPTS: usize = 2;
-
-/// Type alias for TokioResolver (hickory-resolver 0.25+)
-pub type TokioResolver = Resolver<TokioConnectionProvider>;
 
 /// Information about DNS IP changes
 #[derive(Debug, Clone)]
@@ -65,21 +61,14 @@ pub struct DnsResult {
 
 /// Classify a resolver error as SERVFAIL by its typed response code.
 ///
-/// hickory surfaces a SERVFAIL response as a `Proto` error wrapping
-/// `ProtoErrorKind::NoRecordsFound` carrying the server's `ResponseCode`;
-/// matching on the discriminant (rather than the error's `Debug` string)
-/// keeps the classification stable across hickory releases.
-fn is_servfail(e: &ResolveError) -> bool {
+/// hickory surfaces a SERVFAIL response as a `Dns` error carrying
+/// `DnsError::ResponseCode`; matching on the discriminant (rather than the
+/// error's `Debug` string) keeps the classification stable across hickory
+/// releases.
+fn is_servfail(e: &NetError) -> bool {
     matches!(
-        e.kind(),
-        ResolveErrorKind::Proto(proto_err)
-            if matches!(
-                proto_err.kind(),
-                ProtoErrorKind::NoRecordsFound {
-                    response_code: ResponseCode::ServFail,
-                    ..
-                }
-            )
+        e,
+        NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail))
     )
 }
 
@@ -87,6 +76,7 @@ fn is_servfail(e: &ResolveError) -> bool {
 pub struct DnsProber {
     target: String,
     resolver: TokioResolver,
+    server: String,
     previous_ips: HashSet<IpAddr>,
     timeout: Duration,
 }
@@ -101,7 +91,7 @@ impl DnsProber {
         // Build resolver config
         let (config, opts) = if let Some(server) = dns_server {
             // Use explicit DNS server
-            let name_servers = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
+            let name_servers = vec![NameServerConfig::udp_and_tcp(server)];
             let config = ResolverConfig::from_parts(None, vec![], name_servers);
             let mut opts = ResolverOpts::default();
             opts.timeout = timeout;
@@ -110,7 +100,7 @@ impl DnsProber {
         } else {
             // Use the system resolver configuration (e.g. /etc/resolv.conf on
             // Unix, the registry on Windows). `ResolverConfig::default()` is
-            // Google Public DNS in hickory 0.25, not the system config.
+            // Google Public DNS in hickory 0.25/0.26, not the system config.
             let (config, mut opts) =
                 hickory_resolver::system_conf::read_system_conf().map_err(|e| {
                     ProbeError::Other(format!("Failed to read system DNS configuration: {}", e))
@@ -120,14 +110,27 @@ impl DnsProber {
             (config, opts)
         };
 
-        let resolver =
-            TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
-                .with_options(opts)
-                .build();
+        // Remember the first nameserver for reporting: `Resolver::config()`
+        // no longer exists in hickory 0.26, so capture it up front. Keep the
+        // historical `"<ip>:<port>"` format (port from the first connection).
+        let server = config
+            .name_servers()
+            .first()
+            .map(|ns| match ns.connections.first() {
+                Some(conn) => format!("{}:{}", ns.ip, conn.port),
+                None => ns.ip.to_string(),
+            })
+            .unwrap_or_else(|| "system".to_string());
+
+        let resolver = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            .with_options(opts)
+            .build()
+            .map_err(|e| ProbeError::Other(format!("Failed to build DNS resolver: {}", e)))?;
 
         Ok(Self {
             target: target.to_string(),
             resolver,
+            server,
             previous_ips: HashSet::new(),
             timeout,
         })
@@ -157,10 +160,10 @@ impl DnsProber {
                 let current_ips: HashSet<IpAddr> = ips.iter().cloned().collect();
 
                 // Get TTL from the response records
-                let ttl_secs = lookup.as_lookup().records().iter().map(|r| r.ttl()).next();
+                let ttl_secs = lookup.as_lookup().answers().iter().map(|r| r.ttl).next();
 
                 // Get the server used (from resolver config)
-                let server = self.get_dns_server_string();
+                let server = self.server.clone();
 
                 // Detect changes
                 let change_info = detect_dns_change(&self.previous_ips, &current_ips);
@@ -191,7 +194,7 @@ impl DnsProber {
                     resolve_ms,
                     ips: vec![],
                     ttl_secs: None,
-                    server: self.get_dns_server_string(),
+                    server: self.server.clone(),
                     status,
                     change_info: None,
                 }
@@ -202,23 +205,12 @@ impl DnsProber {
                     resolve_ms,
                     ips: vec![],
                     ttl_secs: None,
-                    server: self.get_dns_server_string(),
+                    server: self.server.clone(),
                     status: DnsStatus::Timeout,
                     change_info: None,
                 }
             }
         }
-    }
-
-    /// Get DNS server as string for logging
-    fn get_dns_server_string(&self) -> String {
-        // Try to get the first nameserver from config
-        self.resolver
-            .config()
-            .name_servers()
-            .first()
-            .map(|ns| ns.socket_addr.to_string())
-            .unwrap_or_else(|| "system".to_string())
     }
 }
 

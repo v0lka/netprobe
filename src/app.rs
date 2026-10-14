@@ -22,9 +22,9 @@ use crate::tui::run_tui;
 use crate::tui_tracing::TracingLogReceiver;
 use crate::util::{compute_mos, mos_to_grade};
 use anyhow::{Context, Result};
-use hickory_resolver::Resolver;
-use hickory_resolver::config::{NameServerConfigGroup, ResolverConfig, ResolverOpts};
-use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,9 +32,6 @@ use std::time::Duration;
 use tokio::sync::{Notify, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
-
-/// Type alias for TokioResolver
-pub type TokioResolver = Resolver<TokioConnectionProvider>;
 
 /// Run the netprobe application
 ///
@@ -391,7 +388,7 @@ async fn resolve_target(config: &Config) -> Result<(IpAddr, Option<String>, Vec<
 /// Create a DNS resolver
 fn create_resolver(dns_server: Option<IpAddr>, timeout: Duration) -> Result<TokioResolver> {
     let (config, opts) = if let Some(server) = dns_server {
-        let name_servers = NameServerConfigGroup::from_ips_clear(&[server], 53, true);
+        let name_servers = vec![NameServerConfig::udp_and_tcp(server)];
         let config = ResolverConfig::from_parts(None, vec![], name_servers);
         let mut opts = ResolverOpts::default();
         opts.timeout = timeout;
@@ -400,7 +397,7 @@ fn create_resolver(dns_server: Option<IpAddr>, timeout: Duration) -> Result<Toki
     } else {
         // Use the system resolver configuration (e.g. /etc/resolv.conf on
         // Unix, the registry on Windows). `ResolverConfig::default()` is
-        // Google Public DNS in hickory 0.25, not the system config.
+        // Google Public DNS in hickory 0.25/0.26, not the system config.
         let (config, mut opts) = hickory_resolver::system_conf::read_system_conf()
             .context("Failed to read system DNS configuration (pass --dns-server to override)")?;
         opts.timeout = timeout;
@@ -408,11 +405,10 @@ fn create_resolver(dns_server: Option<IpAddr>, timeout: Duration) -> Result<Toki
         (config, opts)
     };
 
-    Ok(
-        TokioResolver::builder_with_config(config, TokioConnectionProvider::default())
-            .with_options(opts)
-            .build(),
-    )
+    TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+        .context("Failed to build DNS resolver")
 }
 
 /// Run in quiet mode (no TUI, just wait for Ctrl+C)
